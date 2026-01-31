@@ -1,0 +1,4 @@
+project_id = "qrrqgdhvneagmdtqstti"
+
+[functions.analyze-home-issue]
+verify_jwt = false

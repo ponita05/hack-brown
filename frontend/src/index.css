@@ -1,0 +1,218 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* FixDad AI - Home Repair Assistant Design System
+   Warm, trustworthy palette inspired by dad's workshop meets modern tech
+   All colors in HSL format
+*/
+
+@layer base {
+  :root {
+    /* Core backgrounds */
+    --background: 220 20% 97%;
+    --foreground: 220 30% 12%;
+
+    /* Cards & surfaces */
+    --card: 0 0% 100%;
+    --card-foreground: 220 30% 12%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 30% 12%;
+
+    /* Primary - Deep Slate (trustworthy, professional) */
+    --primary: 220 25% 18%;
+    --primary-foreground: 45 100% 96%;
+
+    /* Secondary - Warm Stone */
+    --secondary: 35 15% 92%;
+    --secondary-foreground: 220 25% 18%;
+
+    /* Muted tones */
+    --muted: 220 15% 94%;
+    --muted-foreground: 220 15% 45%;
+
+    /* Accent - Warm Amber (call-to-action, energy) */
+    --accent: 38 92% 50%;
+    --accent-foreground: 220 30% 12%;
+
+    /* Destructive */
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Borders & inputs */
+    --border: 220 15% 88%;
+    --input: 220 15% 88%;
+    --ring: 38 92% 50%;
+
+    --radius: 0.75rem;
+
+    /* Custom semantic tokens */
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 100%;
+    
+    --warning: 38 92% 50%;
+    --warning-foreground: 220 30% 12%;
+
+    /* Gradients */
+    --gradient-hero: linear-gradient(135deg, hsl(220 25% 18%) 0%, hsl(220 30% 25%) 50%, hsl(38 40% 25%) 100%);
+    --gradient-accent: linear-gradient(135deg, hsl(38 92% 50%) 0%, hsl(28 90% 55%) 100%);
+    --gradient-glow: radial-gradient(ellipse at center, hsl(38 92% 50% / 0.15) 0%, transparent 70%);
+    
+    /* Shadows */
+    --shadow-soft: 0 4px 20px -4px hsl(220 30% 12% / 0.1);
+    --shadow-glow: 0 0 40px hsl(38 92% 50% / 0.2);
+    --shadow-card: 0 8px 32px -8px hsl(220 30% 12% / 0.12);
+
+    /* Sidebar */
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 220 15% 30%;
+    --sidebar-primary: 220 25% 18%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 35 15% 95%;
+    --sidebar-accent-foreground: 220 25% 18%;
+    --sidebar-border: 220 15% 90%;
+    --sidebar-ring: 38 92% 50%;
+  }
+
+  .dark {
+    --background: 220 25% 8%;
+    --foreground: 45 20% 95%;
+
+    --card: 220 25% 12%;
+    --card-foreground: 45 20% 95%;
+
+    --popover: 220 25% 12%;
+    --popover-foreground: 45 20% 95%;
+
+    --primary: 45 100% 96%;
+    --primary-foreground: 220 25% 12%;
+
+    --secondary: 220 20% 18%;
+    --secondary-foreground: 45 20% 95%;
+
+    --muted: 220 20% 18%;
+    --muted-foreground: 220 15% 60%;
+
+    --accent: 38 92% 50%;
+    --accent-foreground: 220 30% 12%;
+
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 20% 20%;
+    --input: 220 20% 20%;
+    --ring: 38 92% 50%;
+
+    --gradient-hero: linear-gradient(135deg, hsl(220 25% 8%) 0%, hsl(220 30% 15%) 50%, hsl(38 30% 15%) 100%);
+
+    --sidebar-background: 220 25% 10%;
+    --sidebar-foreground: 45 20% 90%;
+    --sidebar-primary: 38 92% 50%;
+    --sidebar-primary-foreground: 220 25% 8%;
+    --sidebar-accent: 220 20% 15%;
+    --sidebar-accent-foreground: 45 20% 95%;
+    --sidebar-border: 220 20% 18%;
+    --sidebar-ring: 38 92% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  /* Smooth scroll for the whole page */
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+@layer utilities {
+  /* Text gradient utility */
+  .text-gradient-accent {
+    background: linear-gradient(135deg, hsl(38 92% 50%) 0%, hsl(28 90% 55%) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Glow effect for CTAs */
+  .glow-accent {
+    box-shadow: 0 0 40px hsl(38 92% 50% / 0.3), 0 0 80px hsl(38 92% 50% / 0.15);
+  }
+
+  /* Glass morphism effect */
+  .glass {
+    background: hsl(0 0% 100% / 0.8);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  .dark .glass {
+    background: hsl(220 25% 12% / 0.8);
+  }
+
+  /* Pulse animation for live indicators */
+  @keyframes pulse-live {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.7;
+      transform: scale(1.1);
+    }
+  }
+
+  .animate-pulse-live {
+    animation: pulse-live 2s ease-in-out infinite;
+  }
+
+  /* Float animation */
+  @keyframes float {
+    0%, 100% {
+      transform: translateY(0px);
+    }
+    50% {
+      transform: translateY(-10px);
+    }
+  }
+
+  .animate-float {
+    animation: float 6s ease-in-out infinite;
+  }
+
+  /* Fade in up animation */
+  @keyframes fade-in-up {
+    from {
+      opacity: 0;
+      transform: translateY(20px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .animate-fade-in-up {
+    animation: fade-in-up 0.6s ease-out forwards;
+  }
+
+  .animation-delay-200 {
+    animation-delay: 200ms;
+  }
+
+  .animation-delay-400 {
+    animation-delay: 400ms;
+  }
+
+  .animation-delay-600 {
+    animation-delay: 600ms;
+  }
+}
