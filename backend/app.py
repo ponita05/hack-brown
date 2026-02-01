@@ -51,6 +51,19 @@ except Exception as e:
     print(f"⚠️ Llama pipeline import failed: {e}")
     LLAMA_ENABLED = False
 
+# =========================
+# ElevenLabs TTS
+# =========================
+ELEVENLABS_AVAILABLE = False
+try:
+    from elevenlabs import VoiceSettings
+    from elevenlabs.client import ElevenLabs
+    ELEVENLABS_AVAILABLE = True
+    print("✅ ElevenLabs SDK loaded")
+except Exception as e:
+    print(f"⚠️ ElevenLabs import failed: {e}")
+    ELEVENLABS_AVAILABLE = False
+
 
 load_dotenv()
 
@@ -75,6 +88,8 @@ if not GEMINI_API_KEY:
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-70b-versatile")  # change if needed
+
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 
 # ----------------------------
 # Redis connection (fallback to in-memory)
@@ -313,6 +328,8 @@ FixtureType = Literal[
 ]
 
 class VisualFlags(BaseModel):
+    human_visible: bool = False
+    human_interacting: bool = False
     tissue_visible: bool = False
     brown_tissue_visible: bool = False
     standing_water_visible: bool = False
@@ -335,6 +352,8 @@ class HomeIssueExtraction(BaseModel):
     visual_flags: VisualFlags
 
     no_issue_detected: bool = False
+    human_detected: bool = False
+    repair_pending: bool = False
     prospected_issues: list[ProspectedIssue] = Field(min_length=3, max_length=3)
     overall_danger_level: str = Field(pattern="^(low|medium|high)$")
     location: str
@@ -350,9 +369,16 @@ def build_extraction_prompt() -> str:
 You are a home repair expert analyzing ONE image of a household situation.
 
 Your job:
-(1) Identify fixture_type (closed set)
-(2) Extract visual_flags (especially tissue + brown tissue)
-(3) Provide a conservative issue JSON
+(1) Detect if a human being is visible in the frame
+(2) Identify fixture_type (closed set)
+(3) Extract visual_flags (especially tissue + brown tissue)
+(4) Provide a conservative issue JSON
+
+HUMAN DETECTION (PRIORITY #1):
+- FIRST, check if a human being (person) is visible in the frame
+- If yes, set visual_flags.human_visible=true
+- If the human appears to be working on, examining, or interacting with the fixture, set visual_flags.human_interacting=true
+- Even if a human is present, still analyze for issues normally
 
 IMPORTANT RULES:
 - "Dirty bowl / stains" alone is NOT a clog. Clog requires evidence like standing water, water near rim, overflow risk, or clear blockage.
@@ -365,6 +391,8 @@ Return ONLY valid JSON matching this exact schema:
   "fixture_type": "toilet|sink|shower|bathtub|floor_drain|pipe|water_heater|hvac|breaker_panel|appliance|unknown",
   "fixture_type_confidence": 0.0,
   "visual_flags": {
+    "human_visible": true|false,
+    "human_interacting": true|false,
     "tissue_visible": true|false,
     "brown_tissue_visible": true|false,
     "standing_water_visible": true|false,
@@ -375,6 +403,8 @@ Return ONLY valid JSON matching this exact schema:
   },
 
   "no_issue_detected": true|false,
+  "human_detected": true|false,
+  "repair_pending": true|false,
   "prospected_issues": [
     {"rank": 1, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"},
     {"rank": 2, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"},
@@ -396,12 +426,17 @@ STRICT RULES:
 - Confidence 0.0 to 1.0
 - overall_danger_level must be low/medium/high
 
-SPECIAL RULE:
+SPECIAL RULES:
 - If no_issue_detected=true:
   - prospected_issues[0].issue_name must be exactly "No visible issue"
   - overall_danger_level must be "low"
   - requires_shutoff=false, professional_needed=false
   - immediate_action should say "Looks normal. No action needed."
+  - human_detected=false, repair_pending=false
+
+- If issues exist AND human is visible:
+  - Set human_detected=true and repair_pending=true
+  - This indicates someone is working on repairs
 """.strip()
 
 # ============================================================
@@ -704,6 +739,49 @@ def apply_toilet_demo_overrides(parsed_dict: dict) -> dict:
     return parsed_dict
 
 # ============================================================
+# ✅ 4.5) Human detection categorization (three-state system)
+# ============================================================
+
+def categorize_with_human_detection(parsed_dict: dict) -> dict:
+    """
+    Determines the three-state categorization:
+    - Green (success): no_issue_detected=True
+    - Blue (pending): human_detected=True AND issues exist
+    - Red (error): issues exist, no human detected
+
+    This function runs AFTER apply_toilet_demo_overrides to maintain
+    all existing functionality while adding the human detection layer.
+    """
+    try:
+        visual_flags = parsed_dict.get("visual_flags") or {}
+        human_visible = bool(visual_flags.get("human_visible", False))
+        human_interacting = bool(visual_flags.get("human_interacting", False))
+
+        issues = parsed_dict.get("prospected_issues") or []
+        has_issues = len(issues) > 0 and parsed_dict.get("no_issue_detected", False) is False
+
+        # If issues were already marked as resolved, keep that
+        if parsed_dict.get("no_issue_detected", False):
+            parsed_dict["human_detected"] = False
+            parsed_dict["repair_pending"] = False
+            return parsed_dict
+
+        # Issues exist - check for human presence
+        if has_issues and (human_visible or human_interacting):
+            parsed_dict["human_detected"] = True
+            parsed_dict["repair_pending"] = True
+        else:
+            parsed_dict["human_detected"] = False
+            parsed_dict["repair_pending"] = False
+
+    except Exception:
+        # On error, default to no human detection (maintain existing behavior)
+        parsed_dict["human_detected"] = False
+        parsed_dict["repair_pending"] = False
+
+    return parsed_dict
+
+# ============================================================
 # ✅ 5) Better query builder for non-toilet (esp. pipe)
 # ============================================================
 
@@ -941,6 +1019,9 @@ async def analyze_frame(
 
         # (B) Toilet demo hard rule override
         parsed_dict = apply_toilet_demo_overrides(parsed_dict)
+
+        # (B.5) Human detection categorization
+        parsed_dict = categorize_with_human_detection(parsed_dict)
 
         # Save
         store_analysis(session_id, parsed_dict, raw_response=raw_text[:4000])
@@ -1519,6 +1600,70 @@ Rules:
         "solution": solution_text,
         "routed_mode": routed_mode,
     }
+
+# ============================================================
+# ✅ TEXT-TO-SPEECH ENDPOINT (ElevenLabs)
+# ============================================================
+
+class TTSRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=1000)
+    voice_id: Optional[str] = "iP95p4xoKVk53GoZ742B"  # Your custom voice
+
+@app.post("/tts")
+async def text_to_speech(request: TTSRequest):
+    """
+    Convert text to speech using ElevenLabs API.
+    Returns audio bytes that can be played in the browser.
+    """
+    if not ELEVENLABS_AVAILABLE:
+        return {
+            "success": False,
+            "error": "ElevenLabs SDK not installed. Run: pip install elevenlabs"
+        }
+
+    if not ELEVENLABS_API_KEY:
+        return {
+            "success": False,
+            "error": "ELEVENLABS_API_KEY not set in .env file"
+        }
+
+    try:
+        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+
+        # Generate speech with dad-like voice settings
+        audio_generator = client.text_to_speech.convert(
+            text=request.text,
+            voice_id=request.voice_id,
+            model_id="eleven_turbo_v2_5",  # Fast, high-quality model
+            voice_settings=VoiceSettings(
+                stability=0.5,  # More expressive
+                similarity_boost=0.75,  # Clear pronunciation
+                style=0.3,  # Slightly more conversational
+                use_speaker_boost=True
+            )
+        )
+
+        # Collect audio chunks
+        audio_bytes = b""
+        for chunk in audio_generator:
+            if chunk:
+                audio_bytes += chunk
+
+        # Return audio as response
+        from fastapi.responses import Response
+        return Response(
+            content=audio_bytes,
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": "inline; filename=speech.mp3"
+            }
+        )
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"TTS generation failed: {str(e)}"
+        }
 
 if __name__ == "__main__":
     import uvicorn

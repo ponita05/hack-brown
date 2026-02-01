@@ -5,24 +5,19 @@ import { Header } from '@/components/landing/Header';
 import {
   Video,
   VideoOff,
-  Send,
   Camera,
   Loader2,
-  MessageCircle,
   Maximize2,
   Minimize2,
   Play,
   Pause,
   BookOpen,
+  CheckCircle2,
+  RotateCcw,
+  AlertTriangle,
+  ListChecks,
 } from 'lucide-react';
-import { supabase } from '@/integrations/supabase/client';
 import { toast } from 'sonner';
-
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
-  image?: string;
-}
 
 interface ProspectedIssue {
   rank: number;
@@ -34,6 +29,10 @@ interface ProspectedIssue {
 }
 
 interface HomeIssueAnalysis {
+  no_issue_detected?: boolean;
+  human_detected?: boolean;
+  repair_pending?: boolean;
+
   prospected_issues: ProspectedIssue[];
   overall_danger_level: 'low' | 'medium' | 'high';
   location: string;
@@ -56,10 +55,8 @@ type SendResultReason =
   | 'failed'
   | 'network';
 
-// ✅ ms 추가: 프레임 한 번 보내고 응답 오기까지 걸린 시간
 type SendResult = { ok: boolean; reason: SendResultReason; ms?: number };
 
-// RAG /solution response
 interface RagCitation {
   rank: number;
   score: number | null;
@@ -76,62 +73,144 @@ interface RagSolutionResponse {
   error?: string;
 }
 
+// ✅ Guided Fix types
+type GuideOutcome =
+  | 'done'
+  | 'still'
+  | 'flushed_again'
+  | 'reset'
+  | 'danger'
+  | 'skip';
+
+interface GuideStep {
+  step_id: number;
+  title: string;
+  instruction: string;
+  safety_note?: string | null;
+  check_hint?: string | null;
+  is_danger_step: boolean;
+}
+
+interface GuideState {
+  plan_id: string;
+  current_step: number;
+  completed_steps: number[];
+  failed_attempts: Record<string, number>;
+  last_updated: number;
+  status: 'active' | 'done' | 'paused';
+
+  active?: boolean;
+  focus?: {
+    fixture?: string;
+    location?: string;
+    issue_name?: string;
+    category?: string;
+  };
+  interrupt?: {
+    active: boolean;
+    level: 'medium' | 'high';
+    message: string;
+    requires_shutoff: boolean;
+    created_at: number;
+  };
+}
+
+interface GuideInitResponse {
+  success: boolean;
+  session_id: string;
+  plan_id: string;
+  steps: GuideStep[];
+  state: GuideState;
+  selected_reason: string;
+  error?: string;
+}
+
+interface GuideNextResponse {
+  success: boolean;
+  session_id: string;
+  plan_id: string;
+  steps: GuideStep[];
+  state: GuideState;
+  current_step_obj?: GuideStep | null;
+  message: string;
+  error?: string;
+}
+
+type GuideOverlay = null | {
+  active: boolean;
+  type: 'interrupt' | 'step' | 'done';
+  level: 'medium' | 'high';
+  message: string;
+  title?: string;
+  safety_note?: string | null;
+  check_hint?: string | null;
+  requires_shutoff?: boolean;
+  plan_id: string;
+  focus?: {
+    fixture?: string;
+    location?: string;
+    issue_name?: string;
+    category?: string;
+  };
+  status: 'active' | 'done' | 'paused';
+  current_step: number;
+  total_steps: number;
+};
+
 const BACKEND_URL = 'http://127.0.0.1:8000';
 const SESSION_ID = 'demo-session-1';
 
-// ✅ Auto 모드: “응답이 오면” 최대한 빨리 다음 프레임 보냄
-// 이 값은 “응답 후 다음 요청까지의 최소 딜레이”
-const AUTO_CAPTURE_INTERVAL_MS = 300;
+const AUTO_CAPTURE_INTERVAL_MS = 350;
+const CLIENT_MIN_GAP_MS = 900;
 
-// ✅ Manual이 auto(또는 다른 요청) 끝날 때까지 기다릴 때 폴링 간격
 const MANUAL_WAIT_POLL_MS = 120;
-
-// ✅ toast 너무 많이 뜨는 거 방지
 const TOAST_COOLDOWN_MS = 1500;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export default function VideoChat() {
   const [isVideoActive, setIsVideoActive] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // 채팅(Edge function)용 로딩
-  const [isLoading, setIsLoading] = useState(false);
+  // ✅ first analysis gate
+  const [hasFirstAnalysis, setHasFirstAnalysis] = useState(false);
 
-  // 수동 프레임 캡처(backend /frame)용 로딩 (따로!)
+  // backend /frame
   const [manualCaptureLoading, setManualCaptureLoading] = useState(false);
+  const [autoCapture, setAutoCapture] = useState(false);
+  const [latestAnalysis, setLatestAnalysis] =
+    useState<HomeIssueAnalysis | null>(null);
 
-  // ✅ RAG 솔루션 로딩/결과
+  // ✅ RAG
   const [solutionLoading, setSolutionLoading] = useState(false);
   const [finalSolution, setFinalSolution] = useState<string | null>(null);
   const [citations, setCitations] = useState<RagCitation[]>([]);
   const [ragQuery, setRagQuery] = useState<string>('');
 
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [inputMessage, setInputMessage] = useState('');
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  const [autoCapture, setAutoCapture] = useState(false);
-  const [latestAnalysis, setLatestAnalysis] =
-    useState<HomeIssueAnalysis | null>(null);
+  // ✅ Guided Fix
+  const [guideLoading, setGuideLoading] = useState(false);
+  const [guidePlanId, setGuidePlanId] = useState<string | null>(null);
+  const [guideSteps, setGuideSteps] = useState<GuideStep[]>([]);
+  const [guideState, setGuideState] = useState<GuideState | null>(null);
+  const [guideMessage, setGuideMessage] = useState<string>('');
 
+  // backend overlay
+  const [guideOverlay, setGuideOverlay] = useState<GuideOverlay>(null);
+
+  // refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // ✅ rerender 유발 방지: 상태 대신 ref로 “루프/전송 상태” 관리
+  // loop refs
   const inFlightRef = useRef(false);
   const stopLoopRef = useRef(false);
   const loopStartedRef = useRef(false);
   const lastToastAtRef = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
-
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+  const lastClientSendAtRef = useRef(0);
+  const prevHadIssueRef = useRef<boolean | null>(null);
 
   const startVideo = useCallback(async () => {
     try {
@@ -150,6 +229,10 @@ export default function VideoChat() {
 
       await videoRef.current.play();
 
+      setHasFirstAnalysis(false);
+      setLatestAnalysis(null);
+      setGuideOverlay(null);
+
       setIsVideoActive(true);
       toast.success('Camera started! Point at your issue.');
     } catch (error) {
@@ -159,15 +242,12 @@ export default function VideoChat() {
   }, []);
 
   const stopVideo = useCallback(() => {
-    // ✅ 루프 멈추기
     stopLoopRef.current = true;
     loopStartedRef.current = false;
 
-    // ✅ 진행 중 fetch 중단
     abortRef.current?.abort();
     abortRef.current = null;
 
-    // ✅ 카메라 정지
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -178,6 +258,21 @@ export default function VideoChat() {
 
     setAutoCapture(false);
     setIsVideoActive(false);
+
+    setGuideOverlay(null);
+    setLatestAnalysis(null);
+    setHasFirstAnalysis(false);
+
+    // guided + rag reset
+    setGuidePlanId(null);
+    setGuideSteps([]);
+    setGuideState(null);
+    setGuideMessage('');
+    setFinalSolution(null);
+    setCitations([]);
+    setRagQuery('');
+
+    prevHadIssueRef.current = null;
   }, []);
 
   const captureFrame = useCallback((): string | null => {
@@ -198,117 +293,114 @@ export default function VideoChat() {
     return canvas.toDataURL('image/jpeg', 0.8);
   }, []);
 
-  /**
-   * ✅ 백엔드에 프레임 1장 보내고 결과 받기
-   * - Auto 모드에서는 “응답 오면” 다시 보냄 (setInterval X)
-   * - throttled/duplicate/busy는 “실패 토스트”를 띄우지 않는다
-   * - 콘솔에 latency(ms) 출력
-   */
-  const sendFrameToBackend = useCallback(async (): Promise<SendResult> => {
-    if (inFlightRef.current) return { ok: false, reason: 'busy' };
+  const sendFrameToBackend = useCallback(
+    async (showToast: boolean = true): Promise<SendResult> => {
+      if (inFlightRef.current) return { ok: false, reason: 'busy' };
 
-    if (!videoRef.current || videoRef.current.readyState < 2) {
-      return { ok: false, reason: 'video-not-ready' };
-    }
-
-    const dataUrl = captureFrame();
-    if (!dataUrl) return { ok: false, reason: 'no-frame' };
-
-    inFlightRef.current = true;
-
-    const t0 = performance.now();
-    console.log(`[frame] → sending @ ${new Date().toISOString()}`);
-
-    try {
-      // dataURL -> Blob
-      const blobResp = await fetch(dataUrl);
-      const blob = await blobResp.blob();
-
-      const formData = new FormData();
-      formData.append('image', blob, 'frame.jpg');
-      formData.append('session_id', SESSION_ID);
-
-      // ✅ AbortController로 stopVideo 시 요청 중단 가능
-      abortRef.current?.abort();
-      const controller = new AbortController();
-      abortRef.current = controller;
-
-      const res = await fetch(`${BACKEND_URL}/frame`, {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal,
-      });
-
-      const ms = performance.now() - t0;
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        console.error(
-          `[frame] ✗ HTTP ${res.status} in ${ms.toFixed(0)}ms`,
-          text,
-        );
-        return { ok: false, reason: 'failed', ms };
+      const nowMs = Date.now();
+      if (nowMs - lastClientSendAtRef.current < CLIENT_MIN_GAP_MS) {
+        return { ok: false, reason: 'throttled' };
       }
 
-      const result = await res.json().catch(() => null);
+      if (!videoRef.current || videoRef.current.readyState < 2) {
+        return { ok: false, reason: 'video-not-ready' };
+      }
 
-      if (result?.success && result?.data) {
-        const analysis: HomeIssueAnalysis = result.data;
-        setLatestAnalysis(analysis);
+      const dataUrl = captureFrame();
+      if (!dataUrl) return { ok: false, reason: 'no-frame' };
 
-        const topIssue =
-          analysis.prospected_issues?.[0]?.issue_name || 'Issue detected';
+      inFlightRef.current = true;
+      lastClientSendAtRef.current = nowMs;
 
-        const now = Date.now();
-        if (now - lastToastAtRef.current > TOAST_COOLDOWN_MS) {
-          toast.success(`Analyzed: ${topIssue}`);
-          lastToastAtRef.current = now;
+      const t0 = performance.now();
+
+      try {
+        const blobResp = await fetch(dataUrl);
+        const blob = await blobResp.blob();
+
+        const formData = new FormData();
+        formData.append('image', blob, 'frame.jpg');
+        formData.append('session_id', SESSION_ID);
+
+        abortRef.current?.abort();
+        const controller = new AbortController();
+        abortRef.current = controller;
+
+        const res = await fetch(`${BACKEND_URL}/frame`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal,
+        });
+
+        const ms = performance.now() - t0;
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          console.error(`[frame] ✗ HTTP ${res.status}`, text);
+          return { ok: false, reason: 'failed', ms };
         }
 
-        console.log(`[frame] ✓ success in ${ms.toFixed(0)}ms`, { topIssue });
-        return { ok: true, reason: 'ok', ms };
+        const result = await res.json().catch(() => null);
+
+        if (result?.success && result?.data) {
+          const analysis: HomeIssueAnalysis = result.data;
+          setLatestAnalysis(analysis);
+          setHasFirstAnalysis(true);
+
+          setGuideOverlay((result?.guide_overlay ?? null) as GuideOverlay);
+
+          const isNoIssue = analysis?.no_issue_detected === true;
+          const hadIssueNow = !isNoIssue;
+
+          const prevHadIssue = prevHadIssueRef.current;
+          prevHadIssueRef.current = hadIssueNow;
+
+          const topIssue =
+            analysis.prospected_issues?.[0]?.issue_name || 'Issue detected';
+
+          if (showToast) {
+            const now = Date.now();
+            if (now - lastToastAtRef.current > TOAST_COOLDOWN_MS) {
+              if (prevHadIssue === true && isNoIssue) {
+                toast.success('✅ Resolved — looks fixed.');
+              } else if (isNoIssue) {
+                toast.success('✅ Looks good — no issue detected.');
+              } else {
+                toast.success(`🔎 Issue detected: ${topIssue}`);
+              }
+              lastToastAtRef.current = now;
+            }
+          }
+
+          return { ok: true, reason: 'ok', ms };
+        }
+
+        if (result?.skipped) {
+          const reason = String(result.reason || 'skipped');
+          if (reason === 'throttled')
+            return { ok: false, reason: 'throttled', ms };
+          if (reason === 'duplicate')
+            return { ok: false, reason: 'duplicate', ms };
+          if (reason === 'busy') return { ok: false, reason: 'busy', ms };
+          return { ok: false, reason: 'skipped', ms };
+        }
+
+        return { ok: false, reason: 'failed', ms };
+      } catch (error: any) {
+        const ms = performance.now() - t0;
+
+        if (error?.name === 'AbortError') {
+          return { ok: false, reason: 'skipped', ms };
+        }
+        console.error('[frame] ✗ network', error);
+        return { ok: false, reason: 'network', ms };
+      } finally {
+        inFlightRef.current = false;
       }
+    },
+    [captureFrame],
+  );
 
-      if (result?.skipped) {
-        const reason = String(result.reason || 'skipped');
-        console.warn(
-          `[frame] ⚠ skipped(${reason}) in ${ms.toFixed(0)}ms`,
-          result,
-        );
-
-        if (reason === 'throttled')
-          return { ok: false, reason: 'throttled', ms };
-        if (reason === 'duplicate')
-          return { ok: false, reason: 'duplicate', ms };
-        if (reason === 'busy') return { ok: false, reason: 'busy', ms };
-
-        return { ok: false, reason: 'skipped', ms };
-      }
-
-      console.error(
-        `[frame] ✗ Unexpected result in ${ms.toFixed(0)}ms`,
-        result,
-      );
-      return { ok: false, reason: 'failed', ms };
-    } catch (error: any) {
-      const ms = performance.now() - t0;
-
-      if (error?.name === 'AbortError') {
-        console.warn(`[frame] aborted in ${ms.toFixed(0)}ms`);
-        return { ok: false, reason: 'skipped', ms };
-      }
-      console.error(`[frame] ✗ network in ${ms.toFixed(0)}ms`, error);
-      return { ok: false, reason: 'network', ms };
-    } finally {
-      inFlightRef.current = false;
-    }
-  }, [captureFrame]);
-
-  /**
-   * ✅ Auto-Capture 루프 (응답-기반)
-   * - “응답이 오면” 바로 다음 프레임을 보냄
-   * - busy/duplicate/throttled일 때만 약간 기다렸다가 재시도
-   */
   useEffect(() => {
     if (!autoCapture || !isVideoActive) {
       stopLoopRef.current = true;
@@ -323,15 +415,14 @@ export default function VideoChat() {
 
     const run = async () => {
       while (!stopLoopRef.current && autoCapture && isVideoActive) {
-        const r = await sendFrameToBackend();
+        const r = await sendFrameToBackend(true);
 
-        // ✅ 상황별로 “다음 요청까지” 기다리는 시간 조절
         let waitMs = AUTO_CAPTURE_INTERVAL_MS;
 
         if (!r.ok) {
-          if (r.reason === 'busy') waitMs = 250;
+          if (r.reason === 'busy') waitMs = 300;
           else if (r.reason === 'duplicate') waitMs = 700;
-          else if (r.reason === 'throttled') waitMs = 600;
+          else if (r.reason === 'throttled') waitMs = 700;
           else if (r.reason === 'network') {
             waitMs = 1200;
             const now = Date.now();
@@ -342,9 +433,6 @@ export default function VideoChat() {
           } else {
             waitMs = 500;
           }
-        } else {
-          // ok면 최대한 빠르게 (짧게)
-          waitMs = AUTO_CAPTURE_INTERVAL_MS;
         }
 
         await sleep(waitMs);
@@ -363,33 +451,38 @@ export default function VideoChat() {
   const handleManualCapture = async () => {
     setManualCaptureLoading(true);
 
-    // 수동 캡처할 때, 이전 솔루션은 초기화(선택)
     setFinalSolution(null);
     setCitations([]);
     setRagQuery('');
 
-    // ✅ auto나 다른 전송이 돌고 있으면 끝날 때까지 “대기”
     while (inFlightRef.current) {
       await sleep(MANUAL_WAIT_POLL_MS);
     }
 
-    const r = await sendFrameToBackend();
+    const r = await sendFrameToBackend(false);
 
-    if (!r.ok) {
+    if (r.ok) {
+      const a = latestAnalysis;
+      await sleep(10);
+      const a2 = latestAnalysis ?? a;
+
+      const isNoIssue = a2?.no_issue_detected === true;
+      const topIssue =
+        a2?.prospected_issues?.[0]?.issue_name || 'Issue detected';
+
+      if (isNoIssue) toast.success('✅ Looks good — no issue detected.');
+      else toast.success(`🔎 Issue detected: ${topIssue}`);
+    } else {
       if (r.reason === 'network') toast.error('Backend not reachable.');
       else if (r.reason === 'video-not-ready')
         toast.error('Video not ready yet.');
       else if (r.reason === 'no-frame') toast.error('Could not capture frame.');
-      else if (r.reason === 'failed') toast.error('Analysis failed.');
+      else toast.error('Analysis failed. Try steady + better lighting.');
     }
 
     setManualCaptureLoading(false);
   };
 
-  /**
-   * ✅ RAG 솔루션 생성 (backend /solution)
-   * - Redis의 latest 분석(JSON)을 기반으로 RAG retrieval 후 최종 해결책 생성
-   */
   const fetchRagSolution = async () => {
     setSolutionLoading(true);
     try {
@@ -423,386 +516,580 @@ export default function VideoChat() {
     }
   };
 
-  const sendMessage = async (includeImage: boolean = false) => {
-    if (!inputMessage.trim() && !includeImage) return;
-
-    setIsLoading(true);
-
-    let imageData: string | null = null;
-    if (includeImage && isVideoActive) {
-      imageData = captureFrame();
+  // ==========================================================
+  // ✅ Guided Fix
+  // ==========================================================
+  const startGuidedFix = async () => {
+    if (latestAnalysis?.no_issue_detected === true) {
+      toast.error('No issue detected in the latest frame.');
+      return;
     }
 
-    const userMessage: Message = {
-      role: 'user',
-      content:
-        inputMessage ||
-        'What do you see in this image? Help me identify and fix any issues.',
-      image: imageData || undefined,
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
-    setInputMessage('');
-
+    setGuideLoading(true);
     try {
-      const { data, error } = await supabase.functions.invoke(
-        'analyze-home-issue',
-        {
-          body: {
-            message: userMessage.content,
-            image: imageData,
-            history: messages.slice(-6),
-          },
-        },
-      );
+      const res = await fetch(`${BACKEND_URL}/guide/init`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID }),
+      });
 
-      if (error) {
-        console.error('Edge function error:', error);
+      const data: GuideInitResponse = await res.json().catch(() => ({
+        success: false,
+        session_id: SESSION_ID,
+        plan_id: '',
+        steps: [],
+        state: null as any,
+        selected_reason: '',
+        error: 'Invalid JSON from backend',
+      }));
 
-        if (error.message?.includes('429')) {
-          toast.error('Rate limit reached. Please wait and try again.');
-        } else if (error.message?.includes('402')) {
-          toast.error('AI credits exhausted. Please add more credits.');
-        } else {
-          toast.error('Failed to get AI response. Please try again.');
-        }
+      if (!res.ok || !data.success) {
+        toast.error(data.error || `Guide init failed (${res.status})`);
         return;
       }
 
-      const assistantMessage: Message = {
-        role: 'assistant',
-        content: data.response,
-      };
+      setGuidePlanId(data.plan_id);
+      setGuideSteps(data.steps || []);
+      setGuideState(data.state);
+      setGuideMessage(`Guide started (${data.selected_reason})`);
 
-      setMessages((prev) => [...prev, assistantMessage]);
-    } catch (error) {
-      console.error('Error sending message:', error);
-      toast.error('Something went wrong. Please try again.');
+      const cur = data.steps?.[(data.state?.current_step || 1) - 1];
+      setGuideOverlay(
+        cur
+          ? {
+              active: true,
+              type: data.state?.status === 'done' ? 'done' : 'step',
+              level: cur.is_danger_step ? 'high' : 'medium',
+              message: cur.instruction,
+              title: cur.title,
+              safety_note: cur.safety_note ?? null,
+              check_hint: cur.check_hint ?? null,
+              plan_id: data.plan_id,
+              focus: data.state?.focus,
+              status: data.state?.status || 'active',
+              current_step: data.state?.current_step || 1,
+              total_steps: data.steps?.length || 0,
+            }
+          : null,
+      );
+
+      toast.success('Guided Fix started!');
+    } catch (e) {
+      console.error('❌ startGuidedFix error:', e);
+      toast.error('Cannot reach backend /guide/init');
     } finally {
-      setIsLoading(false);
+      setGuideLoading(false);
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage(false);
+  const guideNext = async (outcome: GuideOutcome) => {
+    setGuideLoading(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/guide/next`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID, outcome }),
+      });
+
+      const data: GuideNextResponse = await res.json().catch(() => ({
+        success: false,
+        session_id: SESSION_ID,
+        plan_id: '',
+        steps: [],
+        state: null as any,
+        current_step_obj: null,
+        message: '',
+        error: 'Invalid JSON from backend',
+      }));
+
+      if (!res.ok || !data.success) {
+        toast.error(data.error || `Guide update failed (${res.status})`);
+        return;
+      }
+
+      setGuidePlanId(data.plan_id);
+      setGuideSteps(data.steps || []);
+      setGuideState(data.state);
+      setGuideMessage(data.message || '');
+
+      const st = data.state;
+      const steps = data.steps || [];
+      const idx = Math.max(
+        0,
+        Math.min((st?.current_step || 1) - 1, steps.length - 1),
+      );
+      const cur = st?.status === 'done' ? null : steps[idx];
+
+      if (st?.status === 'done') {
+        setGuideOverlay({
+          active: true,
+          type: 'done',
+          level: 'medium',
+          message:
+            '✅ Guided Fix completed. If it still doesn’t work, escalate to maintenance/plumber.',
+          plan_id: data.plan_id,
+          focus: st?.focus,
+          status: st.status,
+          current_step: st.current_step,
+          total_steps: steps.length,
+        });
+      } else if (cur) {
+        setGuideOverlay({
+          active: true,
+          type: st?.status === 'paused' ? 'interrupt' : 'step',
+          level: cur.is_danger_step ? 'high' : 'medium',
+          message: cur.instruction,
+          title: cur.title,
+          safety_note: cur.safety_note ?? null,
+          check_hint: cur.check_hint ?? null,
+          plan_id: data.plan_id,
+          focus: st?.focus,
+          status: st?.status || 'active',
+          current_step: st?.current_step || 1,
+          total_steps: steps.length,
+        });
+      }
+
+      toast.success(data.message || 'Updated!');
+    } catch (e) {
+      console.error('❌ guideNext error:', e);
+      toast.error('Cannot reach backend /guide/next');
+    } finally {
+      setGuideLoading(false);
     }
   };
+
+  const resetGuidedFix = async () => {
+    setGuideLoading(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/guide/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID }),
+      });
+
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success) {
+        toast.error(data?.error || `Guide reset failed (${res.status})`);
+        return;
+      }
+      setGuidePlanId(null);
+      setGuideSteps([]);
+      setGuideState(null);
+      setGuideMessage('Guide reset.');
+      setGuideOverlay(null);
+      toast.success('Guide reset!');
+    } catch (e) {
+      console.error('❌ resetGuidedFix error:', e);
+      toast.error('Cannot reach backend /guide/reset');
+    } finally {
+      setGuideLoading(false);
+    }
+  };
+
+  const getCurrentGuideStep = (): GuideStep | null => {
+    if (!guideState || guideSteps.length === 0) return null;
+    const idx = Math.max(
+      0,
+      Math.min(guideState.current_step - 1, guideSteps.length - 1),
+    );
+    return guideSteps[idx] || null;
+  };
+
+  // Text-to-Speech function
+  const playVoiceMessage = async (text: string) => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+
+      const contentType = response.headers.get('content-type') || '';
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        console.error('TTS failed HTTP:', response.status, errText);
+        return;
+      }
+
+      if (!contentType.includes('audio')) {
+        const body = await response.text().catch(() => '');
+        console.error('TTS returned non-audio:', contentType, body);
+        return;
+      }
+
+      const audioBlob = await response.blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
+
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+
+      await audio.play(); // <-- 여기서 자동재생 막히면 NotAllowedError 뜸
+
+      audio.onended = () => URL.revokeObjectURL(audioUrl);
+    } catch (error) {
+      console.warn('Voice playback skipped:', error);
+    }
+  };
+
+  const curStep = getCurrentGuideStep();
+
+  // Three-state categorization logic
+  const analysisState = (() => {
+    if (!latestAnalysis) return null;
+
+    if (latestAnalysis.no_issue_detected === true) {
+      return 'success'; // Green
+    }
+
+    if (
+      latestAnalysis.human_detected === true &&
+      latestAnalysis.repair_pending === true
+    ) {
+      return 'pending'; // Blue - NEW STATE
+    }
+
+    return 'error'; // Red
+  })();
+
+  const isLatestNoIssue = analysisState === 'success';
+  const isRepairPending = analysisState === 'pending';
+  const hasErrors = analysisState === 'error';
+
+  // Voice feedback effect - plays audio when state changes
+  useEffect(() => {
+    if (!latestAnalysis || !hasFirstAnalysis) return;
+
+    const topIssue =
+      latestAnalysis.prospected_issues?.[0]?.issue_name || 'issue';
+    const dangerLevel = latestAnalysis.overall_danger_level;
+    const immediateAction = latestAnalysis.immediate_action;
+
+    let message = '';
+
+    if (analysisState === 'success') {
+      message = 'All clear! No issues detected. Everything looks good.';
+    } else if (analysisState === 'pending') {
+      message = `I see you're working on it. The ${topIssue} is still present. Keep going!`;
+    } else if (analysisState === 'error') {
+      if (dangerLevel === 'high') {
+        message = `Attention! I detected ${topIssue}. This requires immediate action. ${immediateAction}`;
+      } else if (dangerLevel === 'medium') {
+        message = `I've spotted ${topIssue}. You should address this soon. ${immediateAction}`;
+      } else {
+        message = `I found ${topIssue}. ${immediateAction}`;
+      }
+    }
+
+    if (message) {
+      playVoiceMessage(message);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [analysisState, hasFirstAnalysis]);
+
+  // ✅ overlay: backend overlay 우선, 아니면 guideState/analysis로 생성
+  const computedOverlay: GuideOverlay = (() => {
+    if (guideOverlay?.active) return guideOverlay;
+
+    if (guideState && curStep && guidePlanId) {
+      return {
+        active: true,
+        type: guideState.status === 'done' ? 'done' : 'step',
+        level: curStep.is_danger_step ? 'high' : 'medium',
+        message:
+          guideState.status === 'done'
+            ? '✅ Guided Fix completed.'
+            : curStep.instruction,
+        title: guideState.status === 'done' ? 'Completed' : curStep.title,
+        safety_note: curStep.safety_note ?? null,
+        check_hint: curStep.check_hint ?? null,
+        plan_id: guidePlanId,
+        focus: guideState.focus,
+        status: guideState.status,
+        current_step: guideState.current_step,
+        total_steps: guideSteps.length,
+      };
+    }
+
+    if (isVideoActive && latestAnalysis && !isLatestNoIssue) {
+      const top = latestAnalysis.prospected_issues?.[0];
+      const level: 'medium' | 'high' =
+        latestAnalysis.overall_danger_level === 'high' ? 'high' : 'medium';
+
+      return {
+        active: true,
+        type: 'step',
+        level,
+        title: 'Guided Fix Ready',
+        message: top
+          ? `Likely issue: ${top.issue_name}\nScroll down for details and start step-by-step.`
+          : `Scroll down for details and start step-by-step.`,
+        safety_note: latestAnalysis.requires_shutoff
+          ? 'Turn off water if leaking/overflow risk.'
+          : null,
+        check_hint: 'Keep camera steady + good lighting.',
+        plan_id: guidePlanId || 'pre-guide',
+        focus: {
+          fixture: latestAnalysis.fixture,
+          location: latestAnalysis.location,
+          category: top?.category,
+          issue_name: top?.issue_name,
+        },
+        status: 'active',
+        current_step: 1,
+        total_steps: guideSteps.length || 0,
+      };
+    }
+
+    // NEW: Repair pending state (human detected with issues)
+    if (isVideoActive && latestAnalysis && isRepairPending) {
+      const top = latestAnalysis.prospected_issues?.[0];
+      return {
+        active: true,
+        type: 'step',
+        level: 'medium',
+        title: 'Human Detected - Repair Pending',
+        message: top
+          ? `Issue: ${top.issue_name}\n\nHuman is present. Continue working on repairs or start guided fix below.`
+          : `Human detected. There are items that need repair. Scroll down for details.`,
+        safety_note: latestAnalysis.requires_shutoff
+          ? 'Turn off water if leaking/overflow risk.'
+          : null,
+        check_hint: 'Keep camera steady for continuous monitoring.',
+        plan_id: guidePlanId || 'pending-repair',
+        focus: {
+          fixture: latestAnalysis.fixture,
+          location: latestAnalysis.location,
+          category: top?.category,
+          issue_name: top?.issue_name,
+        },
+        status: 'active',
+        current_step: 0,
+        total_steps: guideSteps.length || 0,
+      };
+    }
+
+    if (isVideoActive && latestAnalysis && isLatestNoIssue) {
+      return {
+        active: true,
+        type: 'done',
+        level: 'medium',
+        title: 'All Good',
+        message:
+          '✅ No issue detected. Move closer if you still suspect a bug.',
+        safety_note: null,
+        check_hint: 'Keep camera steady.',
+        plan_id: 'idle',
+        focus: {
+          fixture: latestAnalysis.fixture,
+          location: latestAnalysis.location,
+        },
+        status: 'done',
+        current_step: 0,
+        total_steps: 0,
+      };
+    }
+
+    return null;
+  })();
+
+  const overlayToShow = computedOverlay;
+
+  const overlayIsSolved =
+    overlayToShow?.type === 'done' ||
+    (hasFirstAnalysis && latestAnalysis?.no_issue_detected === true);
+  const overlayIsHigh = overlayToShow?.level === 'high';
+
+  const showGuideButtons =
+    !!guideState &&
+    overlayToShow?.type !== 'done' &&
+    guideState.status !== 'done';
+
+  const overlayBg = overlayIsSolved
+    ? 'bg-green-500/25 border-green-500/40'
+    : isRepairPending
+      ? 'bg-blue-500/25 border-blue-500/40'
+      : overlayIsHigh
+        ? 'bg-red-500/25 border-red-500/40'
+        : 'bg-orange-500/20 border-orange-500/35';
+
+  const overlayText = overlayIsSolved
+    ? 'text-green-50'
+    : isRepairPending
+      ? 'text-blue-50'
+      : overlayIsHigh
+        ? 'text-red-50'
+        : 'text-orange-50';
+
+  // =======================================================================
+  // UI helpers for lower panel
+  // =======================================================================
+  const dangerBadge = (() => {
+    if (!latestAnalysis) return null;
+
+    if (isLatestNoIssue) {
+      return (
+        <span className="text-xs px-2 py-1 rounded-full bg-green-500/20 text-green-500">
+          ✅ NORMAL
+        </span>
+      );
+    }
+
+    if (isRepairPending) {
+      return (
+        <span className="text-xs px-2 py-1 rounded-full bg-blue-500/20 text-blue-500">
+          🔧 REPAIR PENDING
+        </span>
+      );
+    }
+
+    const lvl = latestAnalysis.overall_danger_level;
+    const cls =
+      lvl === 'high'
+        ? 'bg-red-500/20 text-red-500'
+        : lvl === 'medium'
+          ? 'bg-yellow-500/20 text-yellow-500'
+          : 'bg-green-500/20 text-green-500';
+    return (
+      <span className={`text-xs px-2 py-1 rounded-full ${cls}`}>
+        ⚠️ {lvl.toUpperCase()}
+      </span>
+    );
+  })();
 
   return (
     <div className="min-h-screen bg-background">
       <Header />
 
-      <main className="pt-20 pb-8">
-        <div className="container px-4">
-          <div
-            className={`grid gap-6 ${
-              isFullscreen ? '' : 'lg:grid-cols-2'
-            } max-w-7xl mx-auto`}
-          >
-            {/* Video Section */}
-            <div className={`${isFullscreen ? 'hidden' : ''} order-1`}>
-              <div className="relative aspect-video bg-primary rounded-2xl overflow-hidden shadow-card">
-                <video
-                  ref={videoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className={`w-full h-full object-cover ${
-                    isVideoActive ? '' : 'hidden'
-                  }`}
-                />
+      {/* ===== HERO VIDEO AREA (전체를 감싸는 메인) ===== */}
+      <main className="pt-20">
+        <div className="px-3 sm:px-4">
+          <div className="max-w-7xl mx-auto">
+            <div
+              className={[
+                'relative rounded-2xl overflow-hidden shadow-card border border-border bg-primary',
+                isFullscreen ? 'h-[calc(100vh-96px)]' : 'h-[70vh] sm:h-[72vh]',
+              ].join(' ')}
+            >
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                className={`w-full h-full object-cover ${
+                  isVideoActive ? '' : 'hidden'
+                }`}
+              />
 
-                {isVideoActive && (
-                  <>
-                    <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-3">
-                      <Button
-                        variant={autoCapture ? 'default' : 'hero'}
-                        size="lg"
-                        onClick={() => setAutoCapture((v) => !v)}
-                        className={
-                          autoCapture ? 'bg-green-600 hover:bg-green-700' : ''
-                        }
-                      >
-                        {autoCapture ? (
-                          <>
-                            <Pause className="w-5 h-5" />
-                            Auto-Analyzing
-                          </>
-                        ) : (
-                          <>
-                            <Play className="w-5 h-5" />
-                            Start Auto-Capture
-                          </>
-                        )}
-                      </Button>
+              {/* Overlay */}
+              {isVideoActive && overlayToShow?.active && (
+                <div className="absolute top-4 right-4 w-[380px] max-w-[92%] z-30">
+                  <div
+                    className={`rounded-2xl border ${overlayBg} backdrop-blur-md p-4 shadow-lg`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className={`text-xs ${overlayText} opacity-90`}>
+                          {overlayIsSolved
+                            ? 'Status • Solved'
+                            : `Guided Fix • Step ${overlayToShow.current_step}/${overlayToShow.total_steps}`}
+                          {overlayToShow?.focus?.fixture
+                            ? ` • ${overlayToShow.focus.fixture}`
+                            : ''}
+                        </div>
 
-                      <Button
-                        variant="secondary"
-                        size="lg"
-                        onClick={handleManualCapture}
-                        disabled={manualCaptureLoading}
-                      >
-                        {manualCaptureLoading ? (
-                          <Loader2 className="w-5 h-5 animate-spin" />
-                        ) : (
-                          <Camera className="w-5 h-5" />
-                        )}
-                        Manual Capture
-                      </Button>
-
-                      <Button
-                        variant="destructive"
-                        size="icon"
-                        onClick={stopVideo}
-                        className="rounded-full"
-                      >
-                        <VideoOff className="w-5 h-5" />
-                      </Button>
-                    </div>
-
-                    <div className="absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full bg-destructive/90 text-destructive-foreground text-sm font-medium">
-                      <span className="w-2 h-2 rounded-full bg-current animate-pulse-live" />
-                      LIVE
-                    </div>
-                  </>
-                )}
-
-                {!isVideoActive && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center text-primary-foreground p-8">
-                    <div className="w-20 h-20 rounded-full bg-primary-foreground/10 flex items-center justify-center mb-6">
-                      <Video className="w-10 h-10" />
-                    </div>
-                    <h3 className="text-xl font-semibold mb-2 text-center">
-                      Start Your Video Session
-                    </h3>
-                    <p className="text-primary-foreground/70 text-center mb-6 max-w-sm">
-                      Point your camera at the issue and our AI will help
-                      identify the problem and guide you through the fix.
-                    </p>
-                    <Button variant="hero" size="lg" onClick={startVideo}>
-                      <Video className="w-5 h-5" />
-                      Start Camera
-                    </Button>
-                  </div>
-                )}
-              </div>
-
-              {/* Latest Analysis Panel */}
-              {latestAnalysis && (
-                <div className="mt-4 p-4 rounded-xl bg-card border border-border">
-                  <h4 className="font-semibold text-foreground mb-3 flex items-center justify-between">
-                    <span>Analysis - Top 3 Issues</span>
-                    <span
-                      className={`text-xs px-2 py-1 rounded-full ${
-                        latestAnalysis.overall_danger_level === 'high'
-                          ? 'bg-red-500/20 text-red-500'
-                          : latestAnalysis.overall_danger_level === 'medium'
-                            ? 'bg-yellow-500/20 text-yellow-500'
-                            : 'bg-green-500/20 text-green-500'
-                      }`}
-                    >
-                      {latestAnalysis.overall_danger_level.toUpperCase()}
-                    </span>
-                  </h4>
-
-                  <div className="space-y-2 text-sm mb-3 pb-3 border-b border-border">
-                    <div>
-                      <span className="font-medium text-foreground">
-                        Location:{' '}
-                      </span>
-                      <span className="text-muted-foreground">
-                        {latestAnalysis.location}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="font-medium text-foreground">
-                        Immediate Action:{' '}
-                      </span>
-                      <span className="text-muted-foreground">
-                        {latestAnalysis.immediate_action}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2">
-                    {latestAnalysis.prospected_issues.map((issue, idx) => (
-                      <div
-                        key={idx}
-                        className={`p-3 rounded-lg border ${
-                          issue.rank === 1
-                            ? 'bg-blue-500/10 border-blue-500/30'
-                            : issue.rank === 2
-                              ? 'bg-purple-500/10 border-purple-500/30'
-                              : 'bg-gray-500/10 border-gray-500/30'
-                        }`}
-                      >
-                        <div className="flex items-start justify-between mb-1">
-                          <div className="flex items-center gap-2">
-                            <span
-                              className={`text-xs font-bold px-2 py-0.5 rounded ${
-                                issue.rank === 1
-                                  ? 'bg-blue-500 text-white'
-                                  : issue.rank === 2
-                                    ? 'bg-purple-500 text-white'
-                                    : 'bg-gray-500 text-white'
-                              }`}
-                            >
-                              #{issue.rank}
-                            </span>
-                            <span className="text-xs font-medium text-muted-foreground uppercase">
-                              {issue.category}
-                            </span>
+                        {overlayToShow.title && (
+                          <div
+                            className={`mt-1 text-sm font-semibold ${overlayText}`}
+                          >
+                            {overlayToShow.title}
                           </div>
-                          <span className="text-xs font-semibold text-foreground">
-                            {Math.round(issue.confidence * 100)}% likely
-                          </span>
-                        </div>
-                        <div className="text-sm font-semibold text-foreground mb-1">
-                          {issue.issue_name}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {issue.suspected_cause}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+                        )}
 
-                  <div className="flex gap-2 text-xs pt-3 mt-3 border-t border-border">
-                    <span
-                      className={`px-2 py-1 rounded ${
-                        latestAnalysis.requires_shutoff
-                          ? 'bg-red-500/20 text-red-500'
-                          : 'bg-gray-500/20 text-gray-500'
-                      }`}
-                    >
-                      {latestAnalysis.requires_shutoff
-                        ? '⚠️ Shutoff Required'
-                        : '✓ No Shutoff'}
-                    </span>
-                    <span
-                      className={`px-2 py-1 rounded ${
-                        latestAnalysis.professional_needed
-                          ? 'bg-orange-500/20 text-orange-500'
-                          : 'bg-blue-500/20 text-blue-500'
-                      }`}
-                    >
-                      {latestAnalysis.professional_needed
-                        ? '👷 Pro Needed'
-                        : '🔧 DIY Possible'}
-                    </span>
-                  </div>
-
-                  {/* ✅ RAG 버튼 */}
-                  <div className="mt-4 flex gap-2">
-                    <Button
-                      onClick={fetchRagSolution}
-                      disabled={solutionLoading}
-                      className="rounded-xl"
-                    >
-                      {solutionLoading ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <BookOpen className="w-4 h-4" />
-                      )}
-                      Generate Solution (RAG)
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      onClick={() => {
-                        setFinalSolution(null);
-                        setCitations([]);
-                        setRagQuery('');
-                      }}
-                      className="rounded-xl"
-                      disabled={solutionLoading}
-                    >
-                      Clear
-                    </Button>
-                  </div>
-
-                  {/* ✅ RAG 결과 표시 */}
-                  {finalSolution && (
-                    <div className="mt-4 p-4 rounded-xl bg-secondary/40 border border-border">
-                      {ragQuery && (
-                        <div className="text-xs text-muted-foreground mb-2">
-                          <span className="font-medium">RAG Query:</span>{' '}
-                          {ragQuery}
+                        <div
+                          className={`mt-2 text-sm ${overlayText} whitespace-pre-wrap`}
+                        >
+                          {overlayIsSolved
+                            ? '✅ Everything looks normal now.'
+                            : overlayToShow.message}
                         </div>
-                      )}
 
-                      <h5 className="font-semibold text-foreground mb-2">
-                        Fix Plan
-                      </h5>
-                      <div className="text-sm whitespace-pre-wrap text-foreground">
-                        {finalSolution}
+                        {overlayToShow.safety_note && (
+                          <div
+                            className={`mt-2 text-xs ${overlayText} opacity-95 whitespace-pre-wrap`}
+                          >
+                            ⚠️ {overlayToShow.safety_note}
+                          </div>
+                        )}
+
+                        {overlayToShow.check_hint && (
+                          <div
+                            className={`mt-2 text-xs ${overlayText} opacity-80`}
+                          >
+                            Check: {overlayToShow.check_hint}
+                          </div>
+                        )}
                       </div>
 
-                      {citations.length > 0 && (
-                        <div className="mt-4">
-                          <h6 className="text-sm font-semibold text-foreground mb-2">
-                            Sources (Top Matches)
-                          </h6>
-                          <div className="space-y-2">
-                            {citations.slice(0, 3).map((c) => (
-                              <div
-                                key={c.rank}
-                                className="p-3 rounded-lg bg-card border border-border"
-                              >
-                                <div className="flex items-center justify-between mb-1">
-                                  <div className="text-xs font-semibold text-foreground">
-                                    #{c.rank} • {c.source}
-                                  </div>
-                                  <div className="text-xs text-muted-foreground">
-                                    score: {c.score?.toFixed(3) ?? 'n/a'}
-                                  </div>
-                                </div>
-                                <div className="text-xs text-muted-foreground whitespace-pre-wrap">
-                                  {c.text.slice(0, 260)}
-                                  {c.text.length > 260 ? '…' : ''}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
+                      {showGuideButtons && (
+                        <div className="flex flex-col gap-2 shrink-0">
+                          <Button
+                            onClick={() => guideNext('done')}
+                            disabled={guideLoading}
+                            className="rounded-xl"
+                          >
+                            {guideLoading ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <CheckCircle2 className="w-4 h-4" />
+                            )}
+                            Done
+                          </Button>
+
+                          <Button
+                            variant="secondary"
+                            onClick={() => guideNext('still')}
+                            disabled={guideLoading}
+                            className="rounded-xl"
+                          >
+                            Still stuck
+                          </Button>
+
+                          <Button
+                            variant="destructive"
+                            onClick={() => guideNext('flushed_again')}
+                            disabled={guideLoading}
+                            className="rounded-xl"
+                          >
+                            Flushed again
+                          </Button>
                         </div>
                       )}
                     </div>
-                  )}
+                  </div>
                 </div>
               )}
 
-              <div className="mt-4 p-4 rounded-xl bg-secondary/50 border border-border">
-                <h4 className="font-medium text-foreground mb-2 flex items-center gap-2">
-                  <MessageCircle className="w-4 h-4 text-accent" />
-                  Tips for best results
-                </h4>
-                <ul className="text-sm text-muted-foreground space-y-1">
-                  <li>• Ensure good lighting on the problem area</li>
-                  <li>• Hold camera steady and close enough to see details</li>
-                  <li>
-                    • Auto mode sends the next frame right after each result
-                    returns
-                  </li>
-                </ul>
-              </div>
-            </div>
+              {/* Top-left LIVE + Fullscreen */}
+              <div className="absolute top-4 left-4 z-30 flex items-center gap-2">
+                {isVideoActive && (
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-destructive/90 text-destructive-foreground text-sm font-medium">
+                    <span className="w-2 h-2 rounded-full bg-current animate-pulse-live" />
+                    LIVE
+                  </div>
+                )}
 
-            {/* Chat Section */}
-            <div
-              className={`order-2 flex flex-col ${
-                isFullscreen ? 'max-w-3xl mx-auto w-full' : ''
-              }`}
-            >
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-semibold text-foreground">
-                  Chat with FixDad AI
-                </h2>
                 <Button
-                  variant="ghost"
+                  variant="secondary"
                   size="icon"
-                  onClick={() => setIsFullscreen(!isFullscreen)}
-                  className="lg:flex hidden"
+                  onClick={() => setIsFullscreen((v) => !v)}
+                  className="rounded-full"
                 >
                   {isFullscreen ? (
                     <Minimize2 className="w-4 h-4" />
@@ -812,89 +1099,659 @@ export default function VideoChat() {
                 </Button>
               </div>
 
-              <div className="flex-1 min-h-[400px] max-h-[600px] overflow-y-auto rounded-2xl bg-card border border-border p-4 space-y-4">
-                {messages.length === 0 ? (
-                  <div className="h-full flex flex-col items-center justify-center text-center p-8">
-                    <div className="w-16 h-16 rounded-full bg-accent/10 flex items-center justify-center mb-4">
-                      <MessageCircle className="w-8 h-8 text-accent" />
-                    </div>
-                    <h3 className="font-semibold text-foreground mb-2">
-                      Ready to help!
-                    </h3>
-                    <p className="text-muted-foreground text-sm max-w-sm">
-                      Start your camera and capture an image, or just describe
-                      your home issue in the chat below.
-                    </p>
-                  </div>
-                ) : (
-                  messages.map((msg, index) => (
-                    <div
-                      key={index}
-                      className={`flex ${
-                        msg.role === 'user' ? 'justify-end' : 'justify-start'
-                      }`}
-                    >
-                      <div
-                        className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-                          msg.role === 'user'
-                            ? 'bg-primary text-primary-foreground'
-                            : 'bg-secondary text-secondary-foreground'
-                        }`}
-                      >
-                        {msg.image && (
-                          <img
-                            src={msg.image}
-                            alt="Captured frame"
-                            className="rounded-lg mb-2 max-h-48 object-cover"
-                          />
-                        )}
-                        <p className="text-sm whitespace-pre-wrap">
-                          {msg.content}
-                        </p>
-                      </div>
-                    </div>
-                  ))
-                )}
+              {/* Bottom controls */}
+              {isVideoActive ? (
+                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 flex flex-wrap items-center justify-center gap-3">
+                  <Button
+                    variant={autoCapture ? 'default' : 'hero'}
+                    size="lg"
+                    onClick={() => setAutoCapture((v) => !v)}
+                    className={
+                      autoCapture ? 'bg-green-600 hover:bg-green-700' : ''
+                    }
+                  >
+                    {autoCapture ? (
+                      <>
+                        <Pause className="w-5 h-5" />
+                        Auto-Analyzing
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-5 h-5" />
+                        Start Auto-Capture
+                      </>
+                    )}
+                  </Button>
 
-                {isLoading && (
-                  <div className="flex justify-start">
-                    <div className="bg-secondary text-secondary-foreground rounded-2xl px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        <span className="text-sm">Analyzing...</span>
-                      </div>
-                    </div>
-                  </div>
-                )}
+                  <Button
+                    variant="secondary"
+                    size="lg"
+                    onClick={handleManualCapture}
+                    disabled={manualCaptureLoading}
+                  >
+                    {manualCaptureLoading ? (
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                    ) : (
+                      <Camera className="w-5 h-5" />
+                    )}
+                    Manual Capture
+                  </Button>
 
-                <div ref={messagesEndRef} />
+                  <Button
+                    variant="destructive"
+                    size="lg"
+                    onClick={stopVideo}
+                    className="rounded-xl"
+                  >
+                    <VideoOff className="w-5 h-5" />
+                    Stop
+                  </Button>
+                </div>
+              ) : (
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-primary-foreground p-8">
+                  <div className="w-20 h-20 rounded-full bg-primary-foreground/10 flex items-center justify-center mb-6">
+                    <Video className="w-10 h-10" />
+                  </div>
+                  <h3 className="text-xl font-semibold mb-2 text-center">
+                    Start Camera
+                  </h3>
+                  <p className="text-primary-foreground/70 text-center mb-6 max-w-sm">
+                    Point at the issue. Scroll down for Analysis + RAG.
+                  </p>
+                  <Button variant="hero" size="lg" onClick={startVideo}>
+                    <Video className="w-5 h-5" />
+                    Start Camera
+                  </Button>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="max-w-7xl mx-auto mt-6 pb-10">
+            <div className="rounded-2xl bg-card border border-border overflow-hidden">
+              <div className="px-5 py-4 border-b border-border flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-foreground">
+                    Diagnostics Dashboard
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    Scrollable panel • tips / analysis / rag
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">{dangerBadge}</div>
               </div>
 
-              <div className="mt-4 flex gap-2">
-                <div className="flex-1 relative">
-                  <textarea
-                    value={inputMessage}
-                    onChange={(e) => setInputMessage(e.target.value)}
-                    onKeyDown={handleKeyDown}
-                    placeholder="Describe your issue or ask a question..."
-                    className="w-full px-4 py-3 pr-12 rounded-xl bg-card border border-border resize-none focus:outline-none focus:ring-2 focus:ring-ring text-foreground placeholder:text-muted-foreground"
-                    rows={1}
-                  />
+              <div className="p-4 sm:p-5">
+                <div className="grid gap-4 lg:grid-cols-3">
+                  {/* LEFT: Tips */}
+                  <section className="rounded-2xl border border-border bg-secondary/30 p-4">
+                    <div className="text-sm font-semibold text-foreground mb-2">
+                      Tips (Left)
+                    </div>
+                    <ul className="text-sm text-muted-foreground space-y-2">
+                      <li>• Use bright lighting (phone flashlight is fine)</li>
+                      <li>
+                        • Move closer to the object (show details clearly)
+                      </li>
+                      <li>• Reduce camera shake (hold steady for 2 seconds)</li>
+                      <li>
+                        • Auto mode waits for a response before sending the next
+                        frame and enforces a minimum interval
+                      </li>
+                      <li>
+                        • Even if it says “no issue,” try again from a different
+                        angle or distance if symptoms persist
+                      </li>
+                    </ul>
+
+                    <div className="mt-4 pt-4 border-t border-border">
+                      <div className="text-xs font-semibold text-foreground mb-2">
+                        Quick actions
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          variant="secondary"
+                          className="rounded-xl"
+                          onClick={() => {
+                            setFinalSolution(null);
+                            setCitations([]);
+                            setRagQuery('');
+                            toast.success('Cleared RAG output.');
+                          }}
+                          disabled={solutionLoading}
+                        >
+                          Clear RAG
+                        </Button>
+
+                        {!guideState ? (
+                          <Button
+                            className="rounded-xl"
+                            onClick={startGuidedFix}
+                            disabled={
+                              guideLoading || isLatestNoIssue || !latestAnalysis
+                            }
+                          >
+                            {guideLoading ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <Play className="w-4 h-4" />
+                            )}
+                            Start Guided Fix
+                          </Button>
+                        ) : (
+                          <Button
+                            variant="secondary"
+                            className="rounded-xl"
+                            onClick={resetGuidedFix}
+                            disabled={guideLoading}
+                          >
+                            <RotateCcw className="w-4 h-4" />
+                            Reset Guide
+                          </Button>
+                        )}
+                      </div>
+
+                      {!latestAnalysis && (
+                        <div className="mt-3 text-xs text-muted-foreground">
+                          If there’s no analysis yet, try Manual Capture once
+                        </div>
+                      )}
+                    </div>
+                  </section>
+
+                  {/* CENTER: Analysis */}
+                  <section className="rounded-2xl border border-border bg-card p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-sm font-semibold text-foreground">
+                        Analysis (Center)
+                      </div>
+                      {dangerBadge}
+                    </div>
+
+                    {!latestAnalysis ? (
+                      <div className="rounded-xl border border-border bg-muted/20 p-4 text-sm text-muted-foreground">
+                        No analysis yet. Start camera → Manual Capture or Auto.
+                      </div>
+                    ) : isLatestNoIssue ? (
+                      <div className="p-4 rounded-xl bg-green-500/10 border border-green-500/30 text-sm text-foreground">
+                        ✅ No issue detected in the latest frame.
+                        <div className="text-xs text-muted-foreground mt-1">
+                          If you still have symptoms, move closer + better
+                          lighting.
+                        </div>
+                      </div>
+                    ) : isRepairPending ? (
+                      <div className="p-4 rounded-xl bg-blue-500/10 border border-blue-500/30 text-sm text-foreground">
+                        🔧 Human detected - Repairs in progress
+                        <div className="text-xs text-muted-foreground mt-2">
+                          System detected a person working on the fixture.
+                          Issues are still present. Continue repairs or use
+                          guided fix below.
+                        </div>
+                        <div className="mt-4">
+                          {/* Show the issues like normal */}
+                          <div className="space-y-2">
+                            {(latestAnalysis.prospected_issues || [])
+                              .slice(0, 3)
+                              .map((issue) => (
+                                <div
+                                  key={issue.rank}
+                                  className={`p-3 rounded-lg border ${
+                                    issue.rank === 1
+                                      ? 'bg-blue-500/10 border-blue-500/30'
+                                      : issue.rank === 2
+                                        ? 'bg-purple-500/10 border-purple-500/30'
+                                        : 'bg-gray-500/10 border-gray-500/30'
+                                  }`}
+                                >
+                                  <div className="flex items-start justify-between mb-1">
+                                    <div className="flex items-center gap-2">
+                                      <span
+                                        className={`text-xs font-bold px-2 py-0.5 rounded ${
+                                          issue.rank === 1
+                                            ? 'bg-blue-500 text-white'
+                                            : issue.rank === 2
+                                              ? 'bg-purple-500 text-white'
+                                              : 'bg-gray-500 text-white'
+                                        }`}
+                                      >
+                                        #{issue.rank}
+                                      </span>
+                                      <span className="text-xs font-medium text-muted-foreground uppercase">
+                                        {issue.category}
+                                      </span>
+                                    </div>
+                                    <span className="text-xs font-semibold text-foreground">
+                                      {Math.round(issue.confidence * 100)}%
+                                      likely
+                                    </span>
+                                  </div>
+
+                                  <div className="text-sm font-semibold text-foreground mb-1">
+                                    {issue.issue_name}
+                                  </div>
+                                  <div className="text-xs text-muted-foreground">
+                                    {issue.suspected_cause}
+                                  </div>
+                                </div>
+                              ))}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="space-y-2 text-sm mb-3 pb-3 border-b border-border">
+                          <div>
+                            <span className="font-medium text-foreground">
+                              Location:{' '}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {latestAnalysis.location}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="font-medium text-foreground">
+                              Fixture:{' '}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {latestAnalysis.fixture}
+                            </span>
+                          </div>
+                          <div>
+                            <span className="font-medium text-foreground">
+                              Immediate Action:{' '}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {latestAnalysis.immediate_action}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="space-y-2">
+                          {(latestAnalysis.prospected_issues || [])
+                            .slice(0, 3)
+                            .map((issue) => (
+                              <div
+                                key={issue.rank}
+                                className={`p-3 rounded-lg border ${
+                                  issue.rank === 1
+                                    ? 'bg-blue-500/10 border-blue-500/30'
+                                    : issue.rank === 2
+                                      ? 'bg-purple-500/10 border-purple-500/30'
+                                      : 'bg-gray-500/10 border-gray-500/30'
+                                }`}
+                              >
+                                <div className="flex items-start justify-between mb-1">
+                                  <div className="flex items-center gap-2">
+                                    <span
+                                      className={`text-xs font-bold px-2 py-0.5 rounded ${
+                                        issue.rank === 1
+                                          ? 'bg-blue-500 text-white'
+                                          : issue.rank === 2
+                                            ? 'bg-purple-500 text-white'
+                                            : 'bg-gray-500 text-white'
+                                      }`}
+                                    >
+                                      #{issue.rank}
+                                    </span>
+                                    <span className="text-xs font-medium text-muted-foreground uppercase">
+                                      {issue.category}
+                                    </span>
+                                  </div>
+                                  <span className="text-xs font-semibold text-foreground">
+                                    {Math.round(issue.confidence * 100)}% likely
+                                  </span>
+                                </div>
+
+                                <div className="text-sm font-semibold text-foreground mb-1">
+                                  {issue.issue_name}
+                                </div>
+                                <div className="text-xs text-muted-foreground">
+                                  {issue.suspected_cause}
+                                </div>
+                              </div>
+                            ))}
+                        </div>
+
+                        <div className="flex gap-2 text-xs pt-3 mt-3 border-t border-border">
+                          <span
+                            className={`px-2 py-1 rounded ${
+                              latestAnalysis.requires_shutoff
+                                ? 'bg-red-500/20 text-red-500'
+                                : 'bg-gray-500/20 text-gray-500'
+                            }`}
+                          >
+                            {latestAnalysis.requires_shutoff
+                              ? '⚠️ Shutoff Required'
+                              : '✓ No Shutoff'}
+                          </span>
+                          <span
+                            className={`px-2 py-1 rounded ${
+                              latestAnalysis.professional_needed
+                                ? 'bg-orange-500/20 text-orange-500'
+                                : 'bg-blue-500/20 text-blue-500'
+                            }`}
+                          >
+                            {latestAnalysis.professional_needed
+                              ? '👷 Pro Needed'
+                              : '🔧 DIY Possible'}
+                          </span>
+                        </div>
+                      </>
+                    )}
+
+                    {/* Guided Fix Center block */}
+                    <div className="mt-4 p-4 rounded-2xl bg-secondary/25 border border-border">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <ListChecks className="w-4 h-4" />
+                          <div className="text-sm font-semibold text-foreground">
+                            Guided Fix
+                          </div>
+                        </div>
+
+                        {!guideState ? (
+                          <Button
+                            onClick={startGuidedFix}
+                            disabled={
+                              guideLoading || isLatestNoIssue || !latestAnalysis
+                            }
+                            className="rounded-xl"
+                          >
+                            {guideLoading ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <Play className="w-4 h-4" />
+                            )}
+                            Start
+                          </Button>
+                        ) : (
+                          <Button
+                            variant="secondary"
+                            onClick={resetGuidedFix}
+                            disabled={guideLoading}
+                            className="rounded-xl"
+                          >
+                            <RotateCcw className="w-4 h-4" />
+                            Reset
+                          </Button>
+                        )}
+                      </div>
+
+                      {guideState && (
+                        <>
+                          <div className="mt-2 text-xs text-muted-foreground">
+                            Plan:{' '}
+                            <span className="font-medium">{guidePlanId}</span> •
+                            Status:{' '}
+                            <span className="font-medium">
+                              {guideState.status}
+                            </span>
+                            {guideState?.focus?.issue_name
+                              ? ` • Focus: ${guideState.focus.issue_name}`
+                              : ''}
+                          </div>
+
+                          {guideMessage && (
+                            <div className="mt-2 text-sm text-foreground">
+                              {guideMessage}
+                            </div>
+                          )}
+
+                          {curStep && guideState.status !== 'done' && (
+                            <div className="mt-3 p-4 rounded-xl bg-card border border-border">
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <div className="text-xs text-muted-foreground mb-1">
+                                    Step {curStep.step_id} / {guideSteps.length}
+                                  </div>
+                                  <div className="text-sm font-semibold text-foreground">
+                                    {curStep.title}
+                                  </div>
+                                </div>
+
+                                {curStep.is_danger_step && (
+                                  <div className="flex items-center gap-1 text-xs px-2 py-1 rounded bg-red-500/20 text-red-500">
+                                    <AlertTriangle className="w-3 h-3" />
+                                    Safety
+                                  </div>
+                                )}
+                              </div>
+
+                              <div className="mt-3 text-sm text-foreground whitespace-pre-wrap">
+                                {curStep.instruction}
+                              </div>
+
+                              {curStep.safety_note && (
+                                <div className="mt-3 text-sm text-red-500/90 whitespace-pre-wrap">
+                                  ⚠️ {curStep.safety_note}
+                                </div>
+                              )}
+
+                              {curStep.check_hint && (
+                                <div className="mt-3 text-xs text-muted-foreground">
+                                  Check: {curStep.check_hint}
+                                </div>
+                              )}
+
+                              <div className="mt-4 flex flex-wrap gap-2">
+                                <Button
+                                  onClick={() => guideNext('done')}
+                                  disabled={guideLoading}
+                                  className="rounded-xl"
+                                >
+                                  {guideLoading ? (
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                  ) : (
+                                    <CheckCircle2 className="w-4 h-4" />
+                                  )}
+                                  Done
+                                </Button>
+
+                                <Button
+                                  variant="secondary"
+                                  onClick={() => guideNext('still')}
+                                  disabled={guideLoading}
+                                  className="rounded-xl"
+                                >
+                                  Still stuck
+                                </Button>
+
+                                <Button
+                                  variant="destructive"
+                                  onClick={() => guideNext('flushed_again')}
+                                  disabled={guideLoading}
+                                  className="rounded-xl"
+                                >
+                                  I flushed again
+                                </Button>
+                              </div>
+
+                              {/* Progress checklist */}
+                              <div className="mt-4 border-t border-border pt-3">
+                                <div className="text-xs font-semibold text-foreground mb-2">
+                                  Progress
+                                </div>
+                                <div className="space-y-2">
+                                  {guideSteps.map((s) => {
+                                    const done =
+                                      guideState.completed_steps.includes(
+                                        s.step_id,
+                                      );
+                                    const isCurrent =
+                                      guideState.current_step === s.step_id &&
+                                      guideState.status !== 'done';
+                                    return (
+                                      <div
+                                        key={s.step_id}
+                                        className={`flex items-center justify-between p-2 rounded-lg border ${
+                                          done
+                                            ? 'bg-green-500/10 border-green-500/30'
+                                            : isCurrent
+                                              ? 'bg-blue-500/10 border-blue-500/30'
+                                              : 'bg-muted/30 border-border'
+                                        }`}
+                                      >
+                                        <div className="flex items-center gap-2">
+                                          <span
+                                            className={`text-xs font-bold px-2 py-0.5 rounded ${
+                                              done
+                                                ? 'bg-green-600 text-white'
+                                                : isCurrent
+                                                  ? 'bg-blue-600 text-white'
+                                                  : 'bg-gray-500 text-white'
+                                            }`}
+                                          >
+                                            {s.step_id}
+                                          </span>
+                                          <span className="text-xs text-foreground">
+                                            {s.title}
+                                          </span>
+                                        </div>
+                                        <span className="text-xs text-muted-foreground">
+                                          {done ? '✓' : isCurrent ? '→' : ''}
+                                        </span>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            </div>
+                          )}
+
+                          {guideState.status === 'done' && (
+                            <div className="mt-3 p-4 rounded-xl bg-green-500/10 border border-green-500/30">
+                              <div className="font-semibold text-foreground">
+                                ✅ Guided Fix completed
+                              </div>
+                              <div className="text-sm text-muted-foreground mt-1">
+                                If it still doesn’t work, use RAG summary on the
+                                right.
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+
+                      {!guideState && (
+                        <div className="mt-2 text-xs text-muted-foreground">
+                          Start after you have an issue detected.
+                        </div>
+                      )}
+                    </div>
+                  </section>
+
+                  {/* RIGHT: RAG Summary */}
+                  <section className="rounded-2xl border border-border bg-card p-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-sm font-semibold text-foreground">
+                        RAG Summary (Right)
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          onClick={fetchRagSolution}
+                          disabled={solutionLoading}
+                          className="rounded-xl"
+                        >
+                          {solutionLoading ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <BookOpen className="w-4 h-4" />
+                          )}
+                          Generate
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          onClick={() => {
+                            setFinalSolution(null);
+                            setCitations([]);
+                            setRagQuery('');
+                          }}
+                          className="rounded-xl"
+                          disabled={solutionLoading}
+                        >
+                          Clear
+                        </Button>
+                      </div>
+                    </div>
+
+                    {!finalSolution ? (
+                      <div className="rounded-xl border border-border bg-muted/20 p-4 text-sm text-muted-foreground">
+                        No RAG output yet. Click “Generate”.
+                      </div>
+                    ) : (
+                      <div className="rounded-2xl bg-secondary/30 border border-border p-4">
+                        {ragQuery && (
+                          <div className="text-xs text-muted-foreground mb-2">
+                            <span className="font-medium">Query:</span>{' '}
+                            {ragQuery}
+                          </div>
+                        )}
+
+                        <div className="text-sm font-semibold text-foreground mb-2">
+                          Fix Plan
+                        </div>
+                        <div className="text-sm whitespace-pre-wrap text-foreground">
+                          {finalSolution}
+                        </div>
+
+                        {citations.length > 0 && (
+                          <div className="mt-4">
+                            <div className="text-sm font-semibold text-foreground mb-2">
+                              Sources (Top Matches)
+                            </div>
+                            <div className="space-y-2">
+                              {citations.slice(0, 3).map((c) => (
+                                <div
+                                  key={c.rank}
+                                  className="p-3 rounded-lg bg-card border border-border"
+                                >
+                                  <div className="flex items-center justify-between mb-1">
+                                    <div className="text-xs font-semibold text-foreground">
+                                      #{c.rank} • {c.source}
+                                    </div>
+                                    <div className="text-xs text-muted-foreground">
+                                      score: {c.score?.toFixed(3) ?? 'n/a'}
+                                    </div>
+                                  </div>
+                                  <div className="text-xs text-muted-foreground whitespace-pre-wrap">
+                                    {c.text.slice(0, 300)}
+                                    {c.text.length > 300 ? '…' : ''}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    <div className="mt-4 pt-4 border-t border-border">
+                      <div className="text-xs font-semibold text-foreground mb-2">
+                        When to use RAG
+                      </div>
+                      <ul className="text-sm text-muted-foreground space-y-1">
+                        <li>
+                          • When you understand what the issue is, but need
+                          precise, step-by-step instructions
+                        </li>
+                        <li>
+                          • When symptoms remain even after completing the
+                          Guided Fix
+                        </li>
+                        <li>
+                          • When you need a parts, tools, or safety checklist
+                        </li>
+                      </ul>
+                    </div>
+                  </section>
                 </div>
-                <Button
-                  onClick={() => sendMessage(false)}
-                  disabled={isLoading || !inputMessage.trim()}
-                  size="icon"
-                  className="h-[46px] w-[46px] rounded-xl"
-                >
-                  {isLoading ? (
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                  ) : (
-                    <Send className="w-5 h-5" />
-                  )}
-                </Button>
               </div>
             </div>
+
+            {/* small footer padding */}
+            <div className="h-10" />
           </div>
         </div>
       </main>
