@@ -4,7 +4,7 @@ import json
 import time
 import asyncio
 import hashlib
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Literal, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,11 +43,9 @@ REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
 REDIS_TTL_SECONDS = int(os.environ.get("REDIS_TTL_SECONDS", "86400"))
 
-# auto-capture가 4초면 throttle은 4~5초가 맞음 (너는 6초라 충돌이 잦음)
 MIN_SECONDS_PER_SESSION = float(os.environ.get("MIN_SECONDS_PER_SESSION", "4"))
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "20"))
 
-# 🔒 Busy 락 TTL (Gemini timeout보다 조금 크게)
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "30"))
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -62,6 +60,9 @@ latest_by_session: Dict[str, dict] = {}
 status_by_session: Dict[str, str] = {}
 last_call_by_session: Dict[str, float] = {}
 last_hash_by_session: Dict[str, str] = {}
+
+# Guide fallback memory
+guide_state_by_session: Dict[str, dict] = {}
 
 try:
     redis_client = redis.Redis(
@@ -102,7 +103,7 @@ app.add_middleware(
 # Gemini
 # ----------------------------
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.5-pro")
+model = genai.GenerativeModel("gemini-2.0-flash")
 
 # ----------------------------
 # Redis key helpers
@@ -128,6 +129,11 @@ def k_solution_latest(session_id: str) -> str:
 def k_lock(session_id: str) -> str:
     return f"session:{session_id}:lock"
 
+def k_guide_state(session_id: str) -> str:
+    return f"session:{session_id}:guide:state"
+
+def k_guide_plan(session_id: str) -> str:
+    return f"session:{session_id}:guide:plan"
 
 # ----------------------------
 # State store helpers
@@ -199,78 +205,18 @@ def get_history(session_id: str, limit: int = 50):
     hist = analysis_history.get(session_id, [])
     return list(reversed(hist[-limit:]))
 
-
 # ----------------------------
-# 🔒 Redis distributed lock helpers (핵심 수정)
+# 🔒 Redis distributed lock helpers
 # ----------------------------
 def acquire_lock(session_id: str) -> bool:
-    """
-    락을 잡으면 True, 이미 잡혀있으면 False.
-    Redis 없으면 항상 True (단일 프로세스 가정).
-    """
     if not USE_REDIS:
         return True
     token = str(time.time())
-    # SET key value NX EX ttl  => 분산락 기본 패턴
     return bool(redis_client.set(k_lock(session_id), token, nx=True, ex=LOCK_TTL_SECONDS))
 
 def release_lock(session_id: str):
     if USE_REDIS:
         redis_client.delete(k_lock(session_id))
-
-
-# ----------------------------
-# JSON schema models
-# ----------------------------
-class ProspectedIssue(BaseModel):
-    rank: int = Field(ge=1, le=3)
-    issue_name: str
-    suspected_cause: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    symptoms_match: list[str]
-    category: str
-
-class HomeIssueExtraction(BaseModel):
-    prospected_issues: list[ProspectedIssue] = Field(min_length=3, max_length=3)
-    overall_danger_level: str = Field(pattern="^(low|medium|high)$")
-    location: str
-    fixture: str
-    observed_symptoms: list[str]
-    requires_shutoff: bool
-    water_present: bool
-    immediate_action: str
-    professional_needed: bool
-
-
-def build_extraction_prompt() -> str:
-    return """You are a home repair expert analyzing images of household issues (plumbing, electrical, HVAC, structural, etc.).
-
-Your job is to identify the TOP 3 MOST LIKELY ISSUES and rank them by likelihood. This JSON will be fed to a second LLM that will use RAG to find repair manuals and provide solutions.
-
-Return ONLY valid JSON matching this exact schema:
-{
-  "prospected_issues": [
-    {"rank": 1, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"},
-    {"rank": 2, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"},
-    {"rank": 3, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"}
-  ],
-  "overall_danger_level": "low|medium|high",
-  "location": "...",
-  "fixture": "...",
-  "observed_symptoms": ["..."],
-  "requires_shutoff": true|false,
-  "water_present": true|false,
-  "immediate_action": "...",
-  "professional_needed": true|false
-}
-
-STRICT RULES:
-- Output ONLY the JSON object (no markdown, no commentary).
-- Exactly 3 prospected issues.
-- Confidence 0.0 to 1.0
-- overall_danger_level must be low/medium/high
-""".strip()
-
 
 # ----------------------------
 # Robust JSON extraction helpers
@@ -293,7 +239,6 @@ def extract_json_object(s: str) -> str:
         return s.strip()
     return s[start : end + 1].strip()
 
-
 # ----------------------------
 # RAG citation normalize
 # ----------------------------
@@ -314,10 +259,435 @@ def normalize_passages(passages: Any) -> List[Dict[str, Any]]:
         return out
     return [{"rank": 1, "score": None, "text": str(passages), "source": "docs"}]
 
+# ============================================================
+# ✅ 1) Extraction schema: fixture_type + visual_flags 포함
+# ============================================================
 
-# ----------------------------
+FixtureType = Literal[
+    "toilet",
+    "sink",
+    "shower",
+    "bathtub",
+    "floor_drain",
+    "pipe",
+    "water_heater",
+    "hvac",
+    "breaker_panel",
+    "appliance",
+    "unknown",
+]
+
+class VisualFlags(BaseModel):
+    # ✅ “갈색 휴지 => clog” 같은 데모용 시그널을 여기에 담음
+    tissue_visible: bool = False
+    brown_tissue_visible: bool = False
+    standing_water_visible: bool = False
+    water_near_rim: bool = False
+    leak_visible: bool = False
+    corrosion_rust_visible: bool = False
+    smoke_fire_visible: bool = False
+
+class ProspectedIssue(BaseModel):
+    rank: int = Field(ge=1, le=3)
+    issue_name: str
+    suspected_cause: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    symptoms_match: list[str]
+    category: str
+
+class HomeIssueExtraction(BaseModel):
+    # ✅ 라우팅 핵심
+    fixture_type: FixtureType
+    fixture_type_confidence: float = Field(ge=0.0, le=1.0)
+    visual_flags: VisualFlags
+
+    # 기존 필드
+    no_issue_detected: bool = False
+    prospected_issues: list[ProspectedIssue] = Field(min_length=3, max_length=3)
+    overall_danger_level: str = Field(pattern="^(low|medium|high)$")
+    location: str
+    fixture: str
+    observed_symptoms: list[str]
+    requires_shutoff: bool
+    water_present: bool
+    immediate_action: str
+    professional_needed: bool
+
+def build_extraction_prompt() -> str:
+    return """
+You are a home repair expert analyzing ONE image of a household situation.
+
+Your job:
+(1) Identify fixture_type (closed set)
+(2) Extract visual_flags (especially tissue + brown tissue)
+(3) Provide a conservative issue JSON
+
+IMPORTANT RULES:
+- "Dirty bowl / stains" alone is NOT a clog. Clog requires evidence like standing water, water near rim, overflow risk, or clear blockage.
+- However, for TOILET DEMO PURPOSES ONLY:
+  If you see BROWN TISSUE / BROWN PAPER clumps inside toilet bowl, set visual_flags.brown_tissue_visible=true.
+  If fixture_type == "toilet" AND brown_tissue_visible == true, your #1 issue SHOULD be "Toilet clogged (paper blockage)" with high confidence (>=0.85).
+
+Return ONLY valid JSON matching this exact schema:
+{
+  "fixture_type": "toilet|sink|shower|bathtub|floor_drain|pipe|water_heater|hvac|breaker_panel|appliance|unknown",
+  "fixture_type_confidence": 0.0,
+  "visual_flags": {
+    "tissue_visible": true|false,
+    "brown_tissue_visible": true|false,
+    "standing_water_visible": true|false,
+    "water_near_rim": true|false,
+    "leak_visible": true|false,
+    "corrosion_rust_visible": true|false,
+    "smoke_fire_visible": true|false
+  },
+
+  "no_issue_detected": true|false,
+  "prospected_issues": [
+    {"rank": 1, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"},
+    {"rank": 2, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"},
+    {"rank": 3, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"}
+  ],
+  "overall_danger_level": "low|medium|high",
+  "location": "...",
+  "fixture": "...",
+  "observed_symptoms": ["..."],
+  "requires_shutoff": true|false,
+  "water_present": true|false,
+  "immediate_action": "...",
+  "professional_needed": true|false
+}
+
+STRICT RULES:
+- Output ONLY the JSON object (no markdown, no commentary).
+- Exactly 3 prospected issues.
+- Confidence 0.0 to 1.0
+- overall_danger_level must be low/medium/high
+
+SPECIAL RULE:
+- If no_issue_detected=true:
+  - prospected_issues[0].issue_name must be exactly "No visible issue"
+  - overall_danger_level must be "low"
+  - requires_shutoff=false, professional_needed=false
+  - immediate_action should say "Looks normal. No action needed."
+""".strip()
+
+# ============================================================
+# ✅ 2) Toilet demo: Guide skeleton (고정)
+# ============================================================
+
+GuideOutcome = Literal["done", "still", "flushed_again", "reset", "danger", "skip"]
+
+class GuideStep(BaseModel):
+    step_id: int
+    title: str
+    instruction: str
+    safety_note: Optional[str] = None
+    check_hint: Optional[str] = None
+    is_danger_step: bool = False
+
+class GuideFocus(BaseModel):
+    fixture: str = ""
+    location: str = ""
+    issue_name: str = ""
+    category: str = ""
+
+class GuideInterrupt(BaseModel):
+    active: bool = False
+    level: Literal["medium", "high"] = "high"
+    message: str = ""
+    requires_shutoff: bool = False
+    created_at: float = Field(default_factory=lambda: time.time())
+
+class GuideState(BaseModel):
+    plan_id: str
+    current_step: int = 1
+    completed_steps: list[int] = Field(default_factory=list)
+    failed_attempts: dict[str, int] = Field(default_factory=dict)
+    last_updated: float = Field(default_factory=lambda: time.time())
+    status: str = "active"  # active|done|paused
+
+    active: bool = True
+    focus: GuideFocus = Field(default_factory=GuideFocus)
+    interrupt: GuideInterrupt = Field(default_factory=GuideInterrupt)
+
+TOILET_CLOG_PLAN_ID = "toilet_clog_v1"
+
+TOILET_CLOG_STEPS: list[GuideStep] = [
+    GuideStep(
+        step_id=1,
+        title="Stop making it worse",
+        instruction="Stop flushing immediately. If the water is near the rim, do NOT flush again. Watch the water level for 30 seconds.",
+        safety_note="If the water is rising fast, shut off the toilet supply valve (behind the toilet, turn clockwise).",
+        check_hint="Water level is stable (not rising).",
+        is_danger_step=True,
+    ),
+    GuideStep(
+        step_id=2,
+        title="Plunge correctly",
+        instruction="Use a flange plunger. Make a tight seal, then plunge firmly for 20–30 seconds. Wait 10 seconds to see if it drains.",
+        safety_note="Avoid chemical drain cleaners (splash risk).",
+        check_hint="Water drains down or at least drops.",
+        is_danger_step=False,
+    ),
+    GuideStep(
+        step_id=3,
+        title="Second attempt + stop rule",
+        instruction="Try plunging one more round (15–20 seconds). If still clogged, stop using the toilet and escalate.",
+        safety_note="Repeated flushing increases overflow risk.",
+        check_hint="Still blocked after 2 rounds.",
+        is_danger_step=True,
+    ),
+    GuideStep(
+        step_id=4,
+        title="Escalate safely",
+        instruction="Use a toilet auger (snake) if available. Otherwise stop and call maintenance/plumber. Keep the area dry and don’t flush.",
+        safety_note="If sewage backup/overflow occurs, treat as high-risk and escalate immediately.",
+        check_hint="Auger clears the clog OR you decide to call a pro.",
+        is_danger_step=True,
+    ),
+]
+
+GUIDE_PLANS: dict[str, list[GuideStep]] = {TOILET_CLOG_PLAN_ID: TOILET_CLOG_STEPS}
+
+def extract_focus_from_analysis(analysis: dict) -> GuideFocus:
+    issues = analysis.get("prospected_issues", []) or []
+    top = issues[0] if isinstance(issues, list) and len(issues) > 0 and isinstance(issues[0], dict) else {}
+    return GuideFocus(
+        fixture=str(analysis.get("fixture", "") or ""),
+        location=str(analysis.get("location", "") or ""),
+        issue_name=str(top.get("issue_name", "") or ""),
+        category=str(top.get("category", "") or ""),
+    )
+
+def is_danger_escalation(analysis: dict) -> bool:
+    lvl = str(analysis.get("overall_danger_level", "low")).lower()
+    requires = bool(analysis.get("requires_shutoff", False))
+    return lvl == "high" or requires
+
+def load_guide_state(session_id: str) -> Optional[GuideState]:
+    if USE_REDIS:
+        raw = redis_client.get(k_guide_state(session_id))
+        if not raw:
+            return None
+        return GuideState.model_validate_json(raw)
+    raw = guide_state_by_session.get(session_id)
+    return GuideState.model_validate(raw) if raw else None
+
+def save_guide_state(session_id: str, st: GuideState):
+    if USE_REDIS:
+        redis_client.set(k_guide_state(session_id), st.model_dump_json(), ex=REDIS_TTL_SECONDS)
+    else:
+        guide_state_by_session[session_id] = st.model_dump()
+
+def get_plan_steps(plan_id: str) -> list[GuideStep]:
+    return GUIDE_PLANS.get(plan_id, TOILET_CLOG_STEPS)
+
+def clamp_step(step: int, max_step: int) -> int:
+    if step < 1:
+        return 1
+    if step > max_step:
+        return max_step
+    return step
+
+def current_step_obj(plan_id: str, state: GuideState) -> Optional[GuideStep]:
+    steps = get_plan_steps(plan_id)
+    idx = clamp_step(state.current_step, len(steps)) - 1
+    if 0 <= idx < len(steps):
+        return steps[idx]
+    return None
+
+def make_guide_overlay_payload(st: Optional[GuideState]) -> Optional[dict]:
+    if not st or not st.active:
+        return None
+
+    steps = get_plan_steps(st.plan_id)
+    cur = current_step_obj(st.plan_id, st)
+
+    if st.interrupt and st.interrupt.active:
+        return {
+            "active": True,
+            "type": "interrupt",
+            "level": st.interrupt.level,
+            "message": st.interrupt.message,
+            "requires_shutoff": st.interrupt.requires_shutoff,
+            "plan_id": st.plan_id,
+            "focus": st.focus.model_dump(),
+            "status": st.status,
+            "current_step": st.current_step,
+            "total_steps": len(steps),
+        }
+
+    if st.status == "done":
+        return {
+            "active": True,
+            "type": "done",
+            "level": "medium",
+            "message": "✅ Guided Fix completed. If it still doesn’t work, escalate to maintenance/plumber.",
+            "plan_id": st.plan_id,
+            "focus": st.focus.model_dump(),
+            "status": st.status,
+            "current_step": st.current_step,
+            "total_steps": len(steps),
+        }
+
+    return {
+        "active": True,
+        "type": "step",
+        "level": "high" if (cur and cur.is_danger_step) else "medium",
+        "message": (cur.instruction if cur else ""),
+        "title": (cur.title if cur else ""),
+        "safety_note": (cur.safety_note if cur else None),
+        "check_hint": (cur.check_hint if cur else None),
+        "plan_id": st.plan_id,
+        "focus": st.focus.model_dump(),
+        "status": st.status,
+        "current_step": st.current_step,
+        "total_steps": len(steps),
+    }
+
+# ============================================================
+# ✅ 3) Non-toilet: 바로 LLM로 quick steps 생성
+# ============================================================
+
+class QuickStepsResponse(BaseModel):
+    fixture_type: FixtureType
+    steps: list[str] = Field(default_factory=list)
+    safety_notes: list[str] = Field(default_factory=list)
+    when_to_call_pro: list[str] = Field(default_factory=list)
+
+def build_quick_steps_prompt(analysis: dict) -> str:
+    return f"""
+You are FixDad, a careful home repair assistant.
+Given this analysis JSON, produce a safe step-by-step plan.
+
+Constraints:
+- Keep it short and actionable.
+- No dangerous instructions (no opening gas lines, no electrical panel work beyond flipping a breaker, no chemical drain cleaners).
+- If uncertain, ask for one specific next check (e.g., "take a wide shot", "show the valve", "show the label plate").
+- Do NOT invent brand/model part numbers.
+
+Return ONLY valid JSON:
+{{
+  "steps": ["...", "...", "..."],
+  "safety_notes": ["...", "..."],
+  "when_to_call_pro": ["...", "..."]
+}}
+
+ANALYSIS_JSON:
+{json.dumps(analysis, ensure_ascii=False, indent=2)}
+""".strip()
+
+async def generate_quick_steps(analysis: dict) -> QuickStepsResponse:
+    prompt = build_quick_steps_prompt(analysis)
+    resp = await asyncio.wait_for(
+        asyncio.to_thread(model.generate_content, [prompt]),
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    raw_text = extract_json_object((resp.text or "").strip())
+    obj = json.loads(raw_text)
+
+    steps = obj.get("steps") or []
+    safety = obj.get("safety_notes") or []
+    callpro = obj.get("when_to_call_pro") or []
+
+    if not isinstance(steps, list):
+        steps = [str(steps)]
+    if not isinstance(safety, list):
+        safety = [str(safety)]
+    if not isinstance(callpro, list):
+        callpro = [str(callpro)]
+
+    return QuickStepsResponse(
+        fixture_type=str(analysis.get("fixture_type", "unknown")),
+        steps=[str(x) for x in steps][:10],
+        safety_notes=[str(x) for x in safety][:10],
+        when_to_call_pro=[str(x) for x in callpro][:10],
+    )
+
+# ============================================================
+# ✅ 4) Toilet “brown tissue => clogged” 서버 강제 override
+# ============================================================
+
+def apply_toilet_demo_overrides(parsed_dict: dict) -> dict:
+    """
+    fixture_type==toilet & brown_tissue_visible==true -> 무조건 clog로 확정
+    """
+    try:
+        ft = str(parsed_dict.get("fixture_type", "unknown"))
+        flags = parsed_dict.get("visual_flags") or {}
+        brown = bool(flags.get("brown_tissue_visible", False))
+        if ft == "toilet" and brown:
+            # no_issue_detected는 false로
+            parsed_dict["no_issue_detected"] = False
+
+            # water_present는 "대개 있을 가능성"이 높지만, 여기서는 데모 안정성 위해 true로
+            # (원하면 flags.standing_water_visible 기반으로 바꿔도 됨)
+            parsed_dict["water_present"] = True
+
+            # danger는 보통 low~medium. overflow risk이면 medium
+            if bool(flags.get("water_near_rim", False)):
+                parsed_dict["overall_danger_level"] = "medium"
+                parsed_dict["requires_shutoff"] = True
+                parsed_dict["professional_needed"] = False
+                parsed_dict["immediate_action"] = "Stop flushing. Watch water level. Be ready to shut off the toilet supply valve if it rises."
+            else:
+                parsed_dict["overall_danger_level"] = "low"
+                parsed_dict["requires_shutoff"] = False
+                parsed_dict["professional_needed"] = False
+                parsed_dict["immediate_action"] = "Stop flushing. Prepare a flange plunger and try plunging."
+
+            # prospected_issues[0] 강제
+            issues = parsed_dict.get("prospected_issues") or []
+            if len(issues) != 3:
+                # 혹시 LLM이 망치면 안전하게 3개 재구성
+                issues = [
+                    {
+                        "rank": 1,
+                        "issue_name": "Toilet clogged (paper blockage)",
+                        "suspected_cause": "Paper/tissue buildup blocking the trap",
+                        "confidence": 0.9,
+                        "symptoms_match": ["brown tissue visible", "likely paper blockage"],
+                        "category": "plumbing",
+                    },
+                    {
+                        "rank": 2,
+                        "issue_name": "Partial toilet clog",
+                        "suspected_cause": "Partial blockage in the trapway",
+                        "confidence": 0.6,
+                        "symptoms_match": ["tissue visible"],
+                        "category": "plumbing",
+                    },
+                    {
+                        "rank": 3,
+                        "issue_name": "Low flush / weak siphon",
+                        "suspected_cause": "Weak flush may fail to clear solids",
+                        "confidence": 0.35,
+                        "symptoms_match": ["toilet bowl contents not clearing"],
+                        "category": "plumbing",
+                    },
+                ]
+            else:
+                issues[0]["issue_name"] = "Toilet clogged (paper blockage)"
+                issues[0]["suspected_cause"] = "Paper/tissue buildup blocking the trap"
+                issues[0]["confidence"] = max(float(issues[0].get("confidence", 0.0)), 0.9)
+                sm = issues[0].get("symptoms_match") or []
+                if "brown tissue visible" not in sm:
+                    sm.append("brown tissue visible")
+                issues[0]["symptoms_match"] = sm
+                issues[0]["category"] = issues[0].get("category") or "plumbing"
+            parsed_dict["prospected_issues"] = issues
+
+    except Exception:
+        # override 실패해도 원본 유지
+        pass
+
+    return parsed_dict
+
+# ============================================================
 # Debug endpoints
-# ----------------------------
+# ============================================================
+
 @app.get("/debug/redis")
 async def debug_redis():
     if not USE_REDIS:
@@ -348,16 +718,15 @@ async def debug_write(session_id: str = Form("demo-session-1")):
     store_analysis(session_id, test_payload, raw_response="debug_write")
     return {"success": True, "wrote": True, "session_id": session_id}
 
-
-# ----------------------------
+# ============================================================
 # Main endpoints
-# ----------------------------
+# ============================================================
+
 @app.post("/frame")
 async def analyze_frame(
     image: UploadFile = File(...),
     session_id: str = Form("demo-session-1"),
 ):
-    # ✅ 1) 분산락 먼저 (여기서 busy 판정)
     if not acquire_lock(session_id):
         return {
             "success": False,
@@ -367,9 +736,7 @@ async def analyze_frame(
             "status": get_status(session_id),
         }
 
-    # ✅ 2) 어떤 에러가 나도 finally에서 락/상태 해제
     try:
-        # throttle은 락 잡고 나서 체크해야 “동시 요청” 경쟁이 줄어듦
         if should_throttle(session_id):
             return {"success": False, "skipped": True, "reason": "throttled", "session_id": session_id}
 
@@ -386,7 +753,7 @@ async def analyze_frame(
         except Exception as e:
             return {"success": False, "error": f"Bad image: {str(e)}", "session_id": session_id}
 
-        # Gemini 호출
+        # ✅ (A) First LLM call: image -> JSON (fixture_type 포함)
         try:
             resp = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -414,14 +781,74 @@ async def analyze_frame(
                 "session_id": session_id,
             }
 
-        store_analysis(session_id, parsed.model_dump(), raw_response=raw_text[:4000])
-        return {"success": True, "session_id": session_id, "data": parsed.model_dump()}
+        parsed_dict = parsed.model_dump()
+
+        # ✅ (B) Toilet demo hard rule override
+        parsed_dict = apply_toilet_demo_overrides(parsed_dict)
+
+        # 저장
+        store_analysis(session_id, parsed_dict, raw_response=raw_text[:4000])
+
+        fixture_type = str(parsed_dict.get("fixture_type", "unknown"))
+        guide_overlay = None
+        quick_steps = None
+
+        # ✅ (C) Routing
+        # - toilet -> guide overlay 제공(데모 안정)
+        # - non-toilet -> quick steps 바로 생성해서 리턴
+        if fixture_type == "toilet":
+            # guide state 있으면 overlay 반영
+            st = load_guide_state(session_id)
+            if st and st.active and st.status in ("active", "paused"):
+                if is_danger_escalation(parsed_dict):
+                    lvl = str(parsed_dict.get("overall_danger_level", "high")).lower()
+                    requires = bool(parsed_dict.get("requires_shutoff", False))
+                    st.interrupt = GuideInterrupt(
+                        active=True,
+                        level="high" if (lvl == "high" or requires) else "medium",
+                        requires_shutoff=requires,
+                        message=(
+                            "⚠️ High-risk detected. Stop and do immediate safety steps. "
+                            + (f"Immediate action: {parsed_dict.get('immediate_action','')}" if parsed_dict.get("immediate_action") else "")
+                        ).strip(),
+                    )
+                    st.status = "paused"
+                else:
+                    if st.interrupt and st.interrupt.active:
+                        st.interrupt.active = False
+                        st.interrupt.message = ""
+                        if st.status == "paused":
+                            st.status = "active"
+
+                st.last_updated = time.time()
+                save_guide_state(session_id, st)
+                guide_overlay = make_guide_overlay_payload(st)
+
+        else:
+            # non-toilet -> 즉시 step-by-step 생성
+            try:
+                qs = await generate_quick_steps(parsed_dict)
+                quick_steps = qs.model_dump()
+            except Exception as e:
+                quick_steps = {
+                    "fixture_type": fixture_type,
+                    "steps": [],
+                    "safety_notes": [],
+                    "when_to_call_pro": [],
+                    "error": f"quick_steps_failed: {str(e)[:120]}",
+                }
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "data": parsed_dict,
+            "guide_overlay": guide_overlay,
+            "quick_steps": quick_steps,
+        }
 
     finally:
-        # ✅ 어떤 경우든 상태/락 해제
         set_status(session_id, "idle")
         release_lock(session_id)
-
 
 @app.get("/latest/{session_id}")
 async def latest(session_id: str):
@@ -450,10 +877,238 @@ async def health_check():
         "redis_db": REDIS_DB,
     }
 
+# ============================================================
+# Guided Fix endpoints (toilet only)
+# ============================================================
 
-# ----------------------------
-# RAG Solution endpoint
-# ----------------------------
+class GuideInitRequest(BaseModel):
+    session_id: str = "demo-session-1"
+
+@app.post("/guide/init")
+async def guide_init(req: GuideInitRequest):
+    session_id = req.session_id
+
+    latest_item = get_latest(session_id)
+    if not latest_item:
+        return {"success": False, "error": "No analysis found. Capture a frame first.", "session_id": session_id}
+
+    analysis = latest_item.get("data") if isinstance(latest_item, dict) else None
+    if not analysis or not isinstance(analysis, dict):
+        return {"success": False, "error": "Latest analysis missing data", "session_id": session_id}
+
+    # ✅ toilet일 때만 guide 사용
+    if str(analysis.get("fixture_type", "unknown")) != "toilet":
+        return {"success": False, "error": "Guide is enabled only for toilet demo. Use quick_steps for other fixtures.", "session_id": session_id}
+
+    plan_id = TOILET_CLOG_PLAN_ID
+    steps = get_plan_steps(plan_id)
+
+    st = load_guide_state(session_id)
+    if st and st.plan_id == plan_id and st.status in ("active", "paused"):
+        st.active = True
+        st.last_updated = time.time()
+        save_guide_state(session_id, st)
+        return {
+            "success": True,
+            "session_id": session_id,
+            "plan_id": plan_id,
+            "steps": [s.model_dump() for s in steps],
+            "state": st.model_dump(),
+            "selected_reason": "existing state reused",
+        }
+
+    focus = extract_focus_from_analysis(analysis)
+    st = GuideState(
+        plan_id=plan_id,
+        current_step=1,
+        completed_steps=[],
+        failed_attempts={},
+        status="active",
+        active=True,
+        focus=focus,
+        interrupt=GuideInterrupt(active=False),
+    )
+    if USE_REDIS:
+        redis_client.set(k_guide_plan(session_id), plan_id, ex=REDIS_TTL_SECONDS)
+    save_guide_state(session_id, st)
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "plan_id": plan_id,
+        "steps": [s.model_dump() for s in steps],
+        "state": st.model_dump(),
+        "selected_reason": "toilet demo plan",
+    }
+
+@app.get("/guide/state/{session_id}")
+async def guide_state(session_id: str):
+    st = load_guide_state(session_id)
+    if not st:
+        return {"success": False, "error": "No guide state. Call /guide/init first.", "session_id": session_id}
+
+    steps = get_plan_steps(st.plan_id)
+    cur = current_step_obj(st.plan_id, st)
+    overlay = make_guide_overlay_payload(st)
+    return {
+        "success": True,
+        "session_id": session_id,
+        "plan_id": st.plan_id,
+        "steps": [s.model_dump() for s in steps],
+        "state": st.model_dump(),
+        "current_step_obj": cur.model_dump() if cur else None,
+        "guide_overlay": overlay,
+    }
+
+@app.post("/guide/reset")
+async def guide_reset(req: GuideInitRequest):
+    session_id = req.session_id
+    if USE_REDIS:
+        redis_client.delete(k_guide_state(session_id))
+        redis_client.delete(k_guide_plan(session_id))
+    else:
+        guide_state_by_session.pop(session_id, None)
+    return {"success": True, "session_id": session_id, "message": "Guide reset."}
+
+class GuideNextRequest(BaseModel):
+    session_id: str = "demo-session-1"
+    outcome: GuideOutcome = "skip"
+    note: Optional[str] = None
+
+@app.post("/guide/next")
+async def guide_next(req: GuideNextRequest):
+    session_id = req.session_id
+    st = load_guide_state(session_id)
+    if not st:
+        return {"success": False, "error": "No guide state. Call /guide/init first.", "session_id": session_id}
+
+    steps = get_plan_steps(st.plan_id)
+    max_step = len(steps)
+
+    if req.outcome == "reset":
+        st.current_step = 1
+        st.completed_steps = []
+        st.failed_attempts = {}
+        st.status = "active"
+        st.active = True
+        st.interrupt = GuideInterrupt(active=False)
+        st.last_updated = time.time()
+        save_guide_state(session_id, st)
+        cur = current_step_obj(st.plan_id, st)
+        return {
+            "success": True,
+            "session_id": session_id,
+            "plan_id": st.plan_id,
+            "steps": [s.model_dump() for s in steps],
+            "state": st.model_dump(),
+            "current_step_obj": cur.model_dump() if cur else None,
+            "message": "Reset to step 1.",
+        }
+
+    if req.outcome == "danger":
+        st.status = "paused"
+        st.last_updated = time.time()
+        save_guide_state(session_id, st)
+        cur = current_step_obj(st.plan_id, st)
+        return {
+            "success": True,
+            "session_id": session_id,
+            "plan_id": st.plan_id,
+            "steps": [s.model_dump() for s in steps],
+            "state": st.model_dump(),
+            "current_step_obj": cur.model_dump() if cur else None,
+            "message": "Pausing: treat as high risk. Stop and escalate.",
+        }
+
+    if st.interrupt and st.interrupt.active and req.outcome in ("done", "still", "skip", "flushed_again"):
+        st.interrupt.active = False
+        st.interrupt.message = ""
+        if st.status == "paused":
+            st.status = "active"
+
+    if req.outcome == "done":
+        if st.current_step not in st.completed_steps:
+            st.completed_steps.append(st.current_step)
+
+        if st.current_step < max_step:
+            st.current_step += 1
+            msg = "Nice. Moving to next step."
+        else:
+            st.status = "done"
+            msg = "All steps completed. If issue persists, escalate / call a pro."
+
+        st.last_updated = time.time()
+        save_guide_state(session_id, st)
+
+        cur = current_step_obj(st.plan_id, st) if st.status != "done" else None
+        return {
+            "success": True,
+            "session_id": session_id,
+            "plan_id": st.plan_id,
+            "steps": [s.model_dump() for s in steps],
+            "state": st.model_dump(),
+            "current_step_obj": cur.model_dump() if cur else None,
+            "message": msg,
+        }
+
+    if req.outcome == "still":
+        k = str(st.current_step)
+        st.failed_attempts[k] = int(st.failed_attempts.get(k, 0)) + 1
+
+        if st.failed_attempts[k] >= 2 and st.current_step < max_step:
+            st.current_step = min(st.current_step + 1, max_step)
+            msg = "Tried enough. Let’s escalate to the next step."
+        else:
+            msg = "Got it. Try the same step once more carefully."
+
+        st.last_updated = time.time()
+        save_guide_state(session_id, st)
+
+        cur = current_step_obj(st.plan_id, st)
+        return {
+            "success": True,
+            "session_id": session_id,
+            "plan_id": st.plan_id,
+            "steps": [s.model_dump() for s in steps],
+            "state": st.model_dump(),
+            "current_step_obj": cur.model_dump() if cur else None,
+            "message": msg,
+        }
+
+    if req.outcome == "flushed_again":
+        st.current_step = 1
+        st.status = "active"
+        st.last_updated = time.time()
+        save_guide_state(session_id, st)
+
+        cur = current_step_obj(st.plan_id, st)
+        return {
+            "success": True,
+            "session_id": session_id,
+            "plan_id": st.plan_id,
+            "steps": [s.model_dump() for s in steps],
+            "state": st.model_dump(),
+            "current_step_obj": cur.model_dump() if cur else None,
+            "message": "You flushed again. Overflow risk is higher now. Back to Step 1: stop flushing and stabilize the water level.",
+        }
+
+    st.last_updated = time.time()
+    save_guide_state(session_id, st)
+    cur = current_step_obj(st.plan_id, st)
+    return {
+        "success": True,
+        "session_id": session_id,
+        "plan_id": st.plan_id,
+        "steps": [s.model_dump() for s in steps],
+        "state": st.model_dump(),
+        "current_step_obj": cur.model_dump() if cur else None,
+        "message": "Current step returned.",
+    }
+
+# ============================================================
+# RAG Solution endpoint (optional, 그대로 유지)
+# ============================================================
+
 class SolutionRequest(BaseModel):
     session_id: str = "demo-session-1"
 
@@ -529,8 +1184,6 @@ Rules:
         "solution": solution_text,
     }
 
-
 if __name__ == "__main__":
     import uvicorn
-    # ✅ 파일명이 main.py면 이게 맞음
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
