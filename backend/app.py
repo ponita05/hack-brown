@@ -5,6 +5,8 @@ import time
 import asyncio
 import hashlib
 from typing import Optional, Any, Dict, List, Literal, Tuple
+from fastapi.responses import Response, JSONResponse
+
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -337,6 +339,7 @@ class VisualFlags(BaseModel):
     leak_visible: bool = False
     corrosion_rust_visible: bool = False
     smoke_fire_visible: bool = False
+    toilet_tank_lid_off: bool = False
 
 class ProspectedIssue(BaseModel):
     rank: int = Field(ge=1, le=3)
@@ -366,22 +369,25 @@ class HomeIssueExtraction(BaseModel):
 
 def build_extraction_prompt() -> str:
     return """
-You are a home repair expert analyzing ONE image of a household situation.
+You are a home repair expert, but also a nice dad, analyzing ONE image of a household situation.
 
 Your job:
-(1) Detect if a human being is visible in the frame
+(1) Detect if a human being is visible in the frame. When you detect it, say what the object is explicitly. 
 (2) Identify fixture_type (closed set)
 (3) Extract visual_flags (especially tissue + brown tissue)
 (4) Provide a conservative issue JSON
 
 HUMAN DETECTION (PRIORITY #1):
-- FIRST, check if a human being (person) is visible in the frame
+- FIRST, check if a human being (person) is visible in the frame, and you don't see any hoome appliances mainly in the screen.
 - If yes, set visual_flags.human_visible=true
 - If the human appears to be working on, examining, or interacting with the fixture, set visual_flags.human_interacting=true
 - Even if a human is present, still analyze for issues normally
+- When the toilet seat cover is missing, whcih means leaving the toilet bowl exposed with visible mounting slots with gray color ,toilet_tank_lid_off: bool = False
+
 
 IMPORTANT RULES:
-- "Dirty bowl / stains" alone is NOT a clog. Clog requires evidence like standing water, water near rim, overflow risk, or clear blockage.
+- Clog requires evidence like standing water, water near rim, overflow risk, or clear blockage.
+- If fixture_type == "toilet" and you see the toilet tank open / lid removed / top cover missing, set visual_flags.toilet_tank_lid_off=true.
 - However, for TOILET DEMO PURPOSES ONLY:
   If you see BROWN TISSUE / BROWN PAPER clumps inside toilet bowl, set visual_flags.brown_tissue_visible=true.
   If fixture_type == "toilet" AND brown_tissue_visible == true, your #1 issue SHOULD be "Toilet clogged (paper blockage)" with high confidence (>=0.85).
@@ -390,17 +396,16 @@ Return ONLY valid JSON matching this exact schema:
 {
   "fixture_type": "toilet|sink|shower|bathtub|floor_drain|pipe|water_heater|hvac|breaker_panel|appliance|unknown",
   "fixture_type_confidence": 0.0,
-  "visual_flags": {
-    "human_visible": true|false,
-    "human_interacting": true|false,
-    "tissue_visible": true|false,
-    "brown_tissue_visible": true|false,
-    "standing_water_visible": true|false,
-    "water_near_rim": true|false,
-    "leak_visible": true|false,
-    "corrosion_rust_visible": true|false,
-    "smoke_fire_visible": true|false
-  },
+"visual_flags": {
+  "tissue_visible": true|false,
+  "brown_tissue_visible": true|false,
+  "standing_water_visible": true|false,
+  "water_near_rim": true|false,
+  "leak_visible": true|false,
+  "corrosion_rust_visible": true|false,
+  "smoke_fire_visible": true|false,
+  "toilet_tank_lid_off": true|false
+},
 
   "no_issue_detected": true|false,
   "human_detected": true|false,

@@ -160,8 +160,8 @@ type GuideOverlay = null | {
 const BACKEND_URL = 'http://127.0.0.1:8000';
 const SESSION_ID = 'demo-session-1';
 
-const AUTO_CAPTURE_INTERVAL_MS = 350;
-const CLIENT_MIN_GAP_MS = 900;
+const AUTO_CAPTURE_INTERVAL_MS = 4000;
+const CLIENT_MIN_GAP_MS = 3800;
 
 const MANUAL_WAIT_POLL_MS = 120;
 const TOAST_COOLDOWN_MS = 1500;
@@ -171,6 +171,9 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export default function VideoChat() {
   const [isVideoActive, setIsVideoActive] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // ✅ FaceTime-style "Dad" speaking indicator
+  const [isDadSpeaking, setIsDadSpeaking] = useState(false);
 
   // ✅ first analysis gate
   const [hasFirstAnalysis, setHasFirstAnalysis] = useState(false);
@@ -233,6 +236,8 @@ export default function VideoChat() {
       setLatestAnalysis(null);
       setGuideOverlay(null);
 
+      setIsDadSpeaking(false);
+
       setIsVideoActive(true);
       toast.success('Camera started! Point at your issue.');
     } catch (error) {
@@ -262,6 +267,9 @@ export default function VideoChat() {
     setGuideOverlay(null);
     setLatestAnalysis(null);
     setHasFirstAnalysis(false);
+
+    // Dad indicator reset
+    setIsDadSpeaking(false);
 
     // guided + rag reset
     setGuidePlanId(null);
@@ -699,44 +707,66 @@ export default function VideoChat() {
   // Text-to-Speech function
   const playVoiceMessage = async (text: string) => {
     try {
+      // turn ON speaking indicator immediately (FaceTime feel)
+      setIsDadSpeaking(true);
+
       const response = await fetch(`${BACKEND_URL}/tts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
       });
 
-      const contentType = response.headers.get('content-type') || '';
-
       if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        console.error('TTS failed HTTP:', response.status, errText);
-        return;
-      }
-
-      if (!contentType.includes('audio')) {
-        const body = await response.text().catch(() => '');
-        console.error('TTS returned non-audio:', contentType, body);
+        console.error('TTS failed:', response.statusText);
+        setIsDadSpeaking(false);
         return;
       }
 
       const audioBlob = await response.blob();
       const audioUrl = URL.createObjectURL(audioBlob);
 
+      // Stop previous audio if playing
       if (audioRef.current) {
+        audioRef.current.onended = null;
         audioRef.current.pause();
         audioRef.current = null;
       }
 
+      // Create and play new audio
       const audio = new Audio(audioUrl);
       audioRef.current = audio;
 
-      await audio.play(); // <-- 여기서 자동재생 막히면 NotAllowedError 뜸
+      // keep indicator ON while audio plays
+      audio.onplaying = () => setIsDadSpeaking(true);
+      audio.onended = () => {
+        setIsDadSpeaking(false);
+        URL.revokeObjectURL(audioUrl);
+      };
+      audio.onerror = () => {
+        setIsDadSpeaking(false);
+        URL.revokeObjectURL(audioUrl);
+      };
 
-      audio.onended = () => URL.revokeObjectURL(audioUrl);
+      await audio.play();
     } catch (error) {
-      console.warn('Voice playback skipped:', error);
+      console.error('Voice playback error:', error);
+      setIsDadSpeaking(false);
     }
   };
+
+  // Safety: if component unmounts, stop audio + speaking indicator
+  useEffect(() => {
+    return () => {
+      try {
+        if (audioRef.current) {
+          audioRef.current.pause();
+          audioRef.current = null;
+        }
+      } finally {
+        setIsDadSpeaking(false);
+      }
+    };
+  }, []);
 
   const curStep = getCurrentGuideStep();
 
@@ -766,34 +796,38 @@ export default function VideoChat() {
   useEffect(() => {
     if (!latestAnalysis || !hasFirstAnalysis) return;
 
-    const topIssue =
-      latestAnalysis.prospected_issues?.[0]?.issue_name || 'issue';
-    const dangerLevel = latestAnalysis.overall_danger_level;
-    const immediateAction = latestAnalysis.immediate_action;
-
     let message = '';
 
     if (analysisState === 'success') {
       message = 'All clear! No issues detected. Everything looks good.';
     } else if (analysisState === 'pending') {
+      const topIssue =
+        latestAnalysis.prospected_issues?.[0]?.issue_name || 'issue';
       message = `I see you're working on it. The ${topIssue} is still present. Keep going!`;
     } else if (analysisState === 'error') {
+      const topIssue =
+        latestAnalysis.prospected_issues?.[0]?.issue_name || 'an issue';
+      const dangerLevel = latestAnalysis.overall_danger_level;
+
       if (dangerLevel === 'high') {
-        message = `Attention! I detected ${topIssue}. This requires immediate action. ${immediateAction}`;
+        message = `Attention! I detected ${topIssue}. This requires immediate action. ${latestAnalysis.immediate_action}`;
       } else if (dangerLevel === 'medium') {
-        message = `I've spotted ${topIssue}. You should address this soon. ${immediateAction}`;
+        message = `I've spotted ${topIssue}. You should address this soon. ${latestAnalysis.immediate_action}`;
       } else {
-        message = `I found ${topIssue}. ${immediateAction}`;
+        message = `I found ${topIssue}. ${latestAnalysis.immediate_action}`;
       }
     }
 
     if (message) {
       playVoiceMessage(message);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [analysisState, hasFirstAnalysis]);
+  }, [
+    analysisState,
+    latestAnalysis?.prospected_issues?.[0]?.issue_name,
+    hasFirstAnalysis,
+  ]);
 
-  // ✅ overlay: backend overlay 우선, 아니면 guideState/analysis로 생성
+  // ✅ overlay: prefer backend overlay, else computed
   const computedOverlay: GuideOverlay = (() => {
     if (guideOverlay?.active) return guideOverlay;
 
@@ -912,19 +946,19 @@ export default function VideoChat() {
     guideState.status !== 'done';
 
   const overlayBg = overlayIsSolved
-    ? 'bg-green-500/25 border-green-500/40'
+    ? 'bg-emerald-500/30 border-emerald-400/50 shadow-lg shadow-emerald-500/20'
     : isRepairPending
-      ? 'bg-blue-500/25 border-blue-500/40'
+      ? 'bg-cyan-500/30 border-cyan-400/50 shadow-lg shadow-cyan-500/20'
       : overlayIsHigh
-        ? 'bg-red-500/25 border-red-500/40'
-        : 'bg-orange-500/20 border-orange-500/35';
+        ? 'bg-rose-500/30 border-rose-400/50 shadow-lg shadow-rose-500/20'
+        : 'bg-orange-500/30 border-orange-400/50 shadow-lg shadow-orange-500/20';
 
   const overlayText = overlayIsSolved
-    ? 'text-green-50'
+    ? 'text-emerald-50'
     : isRepairPending
-      ? 'text-blue-50'
+      ? 'text-cyan-50'
       : overlayIsHigh
-        ? 'text-red-50'
+        ? 'text-rose-50'
         : 'text-orange-50';
 
   // =======================================================================
@@ -935,7 +969,7 @@ export default function VideoChat() {
 
     if (isLatestNoIssue) {
       return (
-        <span className="text-xs px-2 py-1 rounded-full bg-green-500/20 text-green-500">
+        <span className="text-xs px-3 py-1.5 rounded-full bg-gradient-to-r from-emerald-500/20 to-green-500/20 text-emerald-600 font-bold border border-emerald-400/30">
           ✅ NORMAL
         </span>
       );
@@ -943,7 +977,7 @@ export default function VideoChat() {
 
     if (isRepairPending) {
       return (
-        <span className="text-xs px-2 py-1 rounded-full bg-blue-500/20 text-blue-500">
+        <span className="text-xs px-3 py-1.5 rounded-full bg-gradient-to-r from-cyan-500/20 to-blue-500/20 text-cyan-600 font-bold border border-cyan-400/30">
           🔧 REPAIR PENDING
         </span>
       );
@@ -952,12 +986,14 @@ export default function VideoChat() {
     const lvl = latestAnalysis.overall_danger_level;
     const cls =
       lvl === 'high'
-        ? 'bg-red-500/20 text-red-500'
+        ? 'bg-gradient-to-r from-rose-500/20 to-red-500/20 text-rose-600 border-rose-400/30'
         : lvl === 'medium'
-          ? 'bg-yellow-500/20 text-yellow-500'
-          : 'bg-green-500/20 text-green-500';
+          ? 'bg-gradient-to-r from-amber-500/20 to-orange-500/20 text-amber-600 border-amber-400/30'
+          : 'bg-gradient-to-r from-emerald-500/20 to-green-500/20 text-emerald-600 border-emerald-400/30';
     return (
-      <span className={`text-xs px-2 py-1 rounded-full ${cls}`}>
+      <span
+        className={`text-xs px-3 py-1.5 rounded-full font-bold border ${cls}`}
+      >
         ⚠️ {lvl.toUpperCase()}
       </span>
     );
@@ -967,7 +1003,7 @@ export default function VideoChat() {
     <div className="min-h-screen bg-background">
       <Header />
 
-      {/* ===== HERO VIDEO AREA (전체를 감싸는 메인) ===== */}
+      {/* ===== HERO VIDEO AREA (main) ===== */}
       <main className="pt-20">
         <div className="px-3 sm:px-4">
           <div className="max-w-7xl mx-auto">
@@ -1042,7 +1078,7 @@ export default function VideoChat() {
                           <Button
                             onClick={() => guideNext('done')}
                             disabled={guideLoading}
-                            className="rounded-xl"
+                            className="rounded-xl bg-gradient-to-r from-emerald-600 to-green-500 hover:from-emerald-700 hover:to-green-600 shadow-md"
                           >
                             {guideLoading ? (
                               <Loader2 className="w-4 h-4 animate-spin" />
@@ -1076,27 +1112,39 @@ export default function VideoChat() {
                 </div>
               )}
 
-              {/* Top-left LIVE + Fullscreen */}
-              <div className="absolute top-4 left-4 z-30 flex items-center gap-2">
+              {/* Top-left: FaceTime-style call chrome + Fullscreen */}
+              <div className="absolute top-4 left-4 z-30 flex items-center gap-3">
+                {/* Dad PiP bubble */}
                 {isVideoActive && (
-                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-destructive/90 text-destructive-foreground text-sm font-medium">
-                    <span className="w-2 h-2 rounded-full bg-current animate-pulse-live" />
-                    LIVE
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={[
+                        'relative w-20 h-20 rounded-full overflow-hidden border-2 backdrop-blur',
+                        isDadSpeaking
+                          ? 'border-orange-400 shadow-[0_0_0_4px_rgba(251,146,60,0.25)]'
+                          : 'border-white/20',
+                      ].join(' ')}
+                    >
+                      <img
+                        src="/dad.png"
+                        alt="HandyDaddy"
+                        className="w-full h-full object-cover"
+                        draggable={false}
+                      />
+
+                      {/* Speaking pulse */}
+                      {isDadSpeaking && (
+                        <div className="absolute inset-0 animate-pulse bg-orange-400/15" />
+                      )}
+                    </div>
+
+                    {/* Call status pill */}
+                    <div className="px-3 py-1.5 rounded-full bg-gradient-to-r from-orange-600 to-orange-500 border border-orange-400/30 backdrop-blur text-white text-xs font-bold tracking-wide shadow-lg shadow-orange-500/30">
+                      HandyDaddy • Connected
+                      {isDadSpeaking ? ' • Speaking…' : ''}
+                    </div>
                   </div>
                 )}
-
-                <Button
-                  variant="secondary"
-                  size="icon"
-                  onClick={() => setIsFullscreen((v) => !v)}
-                  className="rounded-full"
-                >
-                  {isFullscreen ? (
-                    <Minimize2 className="w-4 h-4" />
-                  ) : (
-                    <Maximize2 className="w-4 h-4" />
-                  )}
-                </Button>
               </div>
 
               {/* Bottom controls */}
@@ -1107,7 +1155,9 @@ export default function VideoChat() {
                     size="lg"
                     onClick={() => setAutoCapture((v) => !v)}
                     className={
-                      autoCapture ? 'bg-green-600 hover:bg-green-700' : ''
+                      autoCapture
+                        ? 'bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-700 hover:to-orange-600 shadow-lg shadow-orange-500/30'
+                        : 'bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-700 hover:to-orange-600 shadow-lg shadow-orange-500/30'
                     }
                   >
                     {autoCapture ? (
@@ -1158,7 +1208,11 @@ export default function VideoChat() {
                   <p className="text-primary-foreground/70 text-center mb-6 max-w-sm">
                     Point at the issue. Scroll down for Analysis + RAG.
                   </p>
-                  <Button variant="hero" size="lg" onClick={startVideo}>
+                  <Button
+                    size="lg"
+                    onClick={startVideo}
+                    className="bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-700 hover:to-orange-600 text-white font-bold shadow-xl shadow-orange-500/40 px-8"
+                  >
                     <Video className="w-5 h-5" />
                     Start Camera
                   </Button>
@@ -1171,10 +1225,10 @@ export default function VideoChat() {
             <div className="rounded-2xl bg-card border border-border overflow-hidden">
               <div className="px-5 py-4 border-b border-border flex items-center justify-between gap-3">
                 <div>
-                  <div className="text-sm font-semibold text-foreground">
+                  <div className="text-base font-semibold text-foreground tracking-tight">
                     Diagnostics Dashboard
                   </div>
-                  <div className="text-xs text-muted-foreground">
+                  <div className="text-xs text-muted-foreground font-medium">
                     Scrollable panel • tips / analysis / rag
                   </div>
                 </div>
@@ -1186,10 +1240,10 @@ export default function VideoChat() {
                 <div className="grid gap-4 lg:grid-cols-3">
                   {/* LEFT: Tips */}
                   <section className="rounded-2xl border border-border bg-secondary/30 p-4">
-                    <div className="text-sm font-semibold text-foreground mb-2">
-                      Tips (Left)
+                    <div className="text-base font-semibold text-foreground mb-3 tracking-tight">
+                      Tips
                     </div>
-                    <ul className="text-sm text-muted-foreground space-y-2">
+                    <ul className="text-sm text-muted-foreground space-y-2 leading-relaxed">
                       <li>• Use bright lighting (phone flashlight is fine)</li>
                       <li>
                         • Move closer to the object (show details clearly)
@@ -1206,8 +1260,8 @@ export default function VideoChat() {
                     </ul>
 
                     <div className="mt-4 pt-4 border-t border-border">
-                      <div className="text-xs font-semibold text-foreground mb-2">
-                        Quick actions
+                      <div className="text-sm font-semibold text-foreground mb-3 tracking-tight">
+                        Quick Actions
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <Button
@@ -1226,7 +1280,7 @@ export default function VideoChat() {
 
                         {!guideState ? (
                           <Button
-                            className="rounded-xl"
+                            className="rounded-xl bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-700 hover:to-orange-600 shadow-md"
                             onClick={startGuidedFix}
                             disabled={
                               guideLoading || isLatestNoIssue || !latestAnalysis
@@ -1262,9 +1316,9 @@ export default function VideoChat() {
 
                   {/* CENTER: Analysis */}
                   <section className="rounded-2xl border border-border bg-card p-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="text-sm font-semibold text-foreground">
-                        Analysis (Center)
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="text-base font-semibold text-foreground tracking-tight">
+                        Analysis
                       </div>
                       {dangerBadge}
                     </div>
@@ -1290,30 +1344,29 @@ export default function VideoChat() {
                           guided fix below.
                         </div>
                         <div className="mt-4">
-                          {/* Show the issues like normal */}
                           <div className="space-y-2">
                             {(latestAnalysis.prospected_issues || [])
                               .slice(0, 3)
                               .map((issue) => (
                                 <div
                                   key={issue.rank}
-                                  className={`p-3 rounded-lg border ${
+                                  className={`p-3 rounded-lg border shadow-sm ${
                                     issue.rank === 1
-                                      ? 'bg-blue-500/10 border-blue-500/30'
+                                      ? 'bg-orange-500/15 border-orange-400/40'
                                       : issue.rank === 2
-                                        ? 'bg-purple-500/10 border-purple-500/30'
-                                        : 'bg-gray-500/10 border-gray-500/30'
+                                        ? 'bg-amber-500/15 border-amber-400/40'
+                                        : 'bg-slate-500/15 border-slate-400/40'
                                   }`}
                                 >
                                   <div className="flex items-start justify-between mb-1">
                                     <div className="flex items-center gap-2">
                                       <span
-                                        className={`text-xs font-bold px-2 py-0.5 rounded ${
+                                        className={`text-xs font-bold px-2 py-1 rounded shadow-sm ${
                                           issue.rank === 1
-                                            ? 'bg-blue-500 text-white'
+                                            ? 'bg-gradient-to-r from-orange-600 to-orange-500 text-white'
                                             : issue.rank === 2
-                                              ? 'bg-purple-500 text-white'
-                                              : 'bg-gray-500 text-white'
+                                              ? 'bg-gradient-to-r from-amber-600 to-amber-500 text-white'
+                                              : 'bg-gradient-to-r from-slate-600 to-slate-500 text-white'
                                         }`}
                                       >
                                         #{issue.rank}
@@ -1374,23 +1427,23 @@ export default function VideoChat() {
                             .map((issue) => (
                               <div
                                 key={issue.rank}
-                                className={`p-3 rounded-lg border ${
+                                className={`p-3 rounded-lg border shadow-sm ${
                                   issue.rank === 1
-                                    ? 'bg-blue-500/10 border-blue-500/30'
+                                    ? 'bg-orange-500/15 border-orange-400/40'
                                     : issue.rank === 2
-                                      ? 'bg-purple-500/10 border-purple-500/30'
-                                      : 'bg-gray-500/10 border-gray-500/30'
+                                      ? 'bg-amber-500/15 border-amber-400/40'
+                                      : 'bg-slate-500/15 border-slate-400/40'
                                 }`}
                               >
                                 <div className="flex items-start justify-between mb-1">
                                   <div className="flex items-center gap-2">
                                     <span
-                                      className={`text-xs font-bold px-2 py-0.5 rounded ${
+                                      className={`text-xs font-bold px-2 py-1 rounded shadow-sm ${
                                         issue.rank === 1
-                                          ? 'bg-blue-500 text-white'
+                                          ? 'bg-gradient-to-r from-orange-600 to-orange-500 text-white'
                                           : issue.rank === 2
-                                            ? 'bg-purple-500 text-white'
-                                            : 'bg-gray-500 text-white'
+                                            ? 'bg-gradient-to-r from-amber-600 to-amber-500 text-white'
+                                            : 'bg-gradient-to-r from-slate-600 to-slate-500 text-white'
                                       }`}
                                     >
                                       #{issue.rank}
@@ -1416,10 +1469,10 @@ export default function VideoChat() {
 
                         <div className="flex gap-2 text-xs pt-3 mt-3 border-t border-border">
                           <span
-                            className={`px-2 py-1 rounded ${
+                            className={`px-3 py-1.5 rounded-full font-medium border shadow-sm ${
                               latestAnalysis.requires_shutoff
-                                ? 'bg-red-500/20 text-red-500'
-                                : 'bg-gray-500/20 text-gray-500'
+                                ? 'bg-rose-500/20 text-rose-600 border-rose-400/30'
+                                : 'bg-slate-500/20 text-slate-600 border-slate-400/30'
                             }`}
                           >
                             {latestAnalysis.requires_shutoff
@@ -1427,10 +1480,10 @@ export default function VideoChat() {
                               : '✓ No Shutoff'}
                           </span>
                           <span
-                            className={`px-2 py-1 rounded ${
+                            className={`px-3 py-1.5 rounded-full font-medium border shadow-sm ${
                               latestAnalysis.professional_needed
-                                ? 'bg-orange-500/20 text-orange-500'
-                                : 'bg-blue-500/20 text-blue-500'
+                                ? 'bg-orange-500/20 text-orange-600 border-orange-400/30'
+                                : 'bg-cyan-500/20 text-cyan-600 border-cyan-400/30'
                             }`}
                           >
                             {latestAnalysis.professional_needed
@@ -1446,7 +1499,7 @@ export default function VideoChat() {
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2">
                           <ListChecks className="w-4 h-4" />
-                          <div className="text-sm font-semibold text-foreground">
+                          <div className="text-sm font-semibold text-foreground tracking-tight">
                             Guided Fix
                           </div>
                         </div>
@@ -1457,7 +1510,7 @@ export default function VideoChat() {
                             disabled={
                               guideLoading || isLatestNoIssue || !latestAnalysis
                             }
-                            className="rounded-xl"
+                            className="rounded-xl bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-700 hover:to-orange-600 shadow-md"
                           >
                             {guideLoading ? (
                               <Loader2 className="w-4 h-4 animate-spin" />
@@ -1539,7 +1592,7 @@ export default function VideoChat() {
                                 <Button
                                   onClick={() => guideNext('done')}
                                   disabled={guideLoading}
-                                  className="rounded-xl"
+                                  className="rounded-xl bg-gradient-to-r from-emerald-600 to-green-500 hover:from-emerald-700 hover:to-green-600 shadow-md"
                                 >
                                   {guideLoading ? (
                                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -1585,22 +1638,22 @@ export default function VideoChat() {
                                     return (
                                       <div
                                         key={s.step_id}
-                                        className={`flex items-center justify-between p-2 rounded-lg border ${
+                                        className={`flex items-center justify-between p-2 rounded-lg border shadow-sm ${
                                           done
-                                            ? 'bg-green-500/10 border-green-500/30'
+                                            ? 'bg-emerald-500/15 border-emerald-400/40'
                                             : isCurrent
-                                              ? 'bg-blue-500/10 border-blue-500/30'
+                                              ? 'bg-orange-500/15 border-orange-400/40'
                                               : 'bg-muted/30 border-border'
                                         }`}
                                       >
                                         <div className="flex items-center gap-2">
                                           <span
-                                            className={`text-xs font-bold px-2 py-0.5 rounded ${
+                                            className={`text-xs font-bold px-2 py-1 rounded shadow-sm ${
                                               done
-                                                ? 'bg-green-600 text-white'
+                                                ? 'bg-gradient-to-r from-emerald-600 to-green-500 text-white'
                                                 : isCurrent
-                                                  ? 'bg-blue-600 text-white'
-                                                  : 'bg-gray-500 text-white'
+                                                  ? 'bg-gradient-to-r from-orange-600 to-orange-500 text-white'
+                                                  : 'bg-gradient-to-r from-slate-600 to-slate-500 text-white'
                                             }`}
                                           >
                                             {s.step_id}
@@ -1644,15 +1697,15 @@ export default function VideoChat() {
 
                   {/* RIGHT: RAG Summary */}
                   <section className="rounded-2xl border border-border bg-card p-4">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="text-sm font-semibold text-foreground">
-                        RAG Summary (Right)
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="text-base font-semibold text-foreground tracking-tight">
+                        RAG Summary
                       </div>
                       <div className="flex gap-2">
                         <Button
                           onClick={fetchRagSolution}
                           disabled={solutionLoading}
-                          className="rounded-xl"
+                          className="rounded-xl bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-700 hover:to-orange-600 shadow-md"
                         >
                           {solutionLoading ? (
                             <Loader2 className="w-4 h-4 animate-spin" />
@@ -1689,16 +1742,16 @@ export default function VideoChat() {
                           </div>
                         )}
 
-                        <div className="text-sm font-semibold text-foreground mb-2">
+                        <div className="text-base font-semibold text-foreground mb-3 tracking-tight">
                           Fix Plan
                         </div>
-                        <div className="text-sm whitespace-pre-wrap text-foreground">
+                        <div className="text-sm whitespace-pre-wrap text-foreground leading-relaxed">
                           {finalSolution}
                         </div>
 
                         {citations.length > 0 && (
                           <div className="mt-4">
-                            <div className="text-sm font-semibold text-foreground mb-2">
+                            <div className="text-sm font-semibold text-foreground mb-3 tracking-tight">
                               Sources (Top Matches)
                             </div>
                             <div className="space-y-2">
@@ -1750,7 +1803,6 @@ export default function VideoChat() {
               </div>
             </div>
 
-            {/* small footer padding */}
             <div className="h-10" />
           </div>
         </div>
