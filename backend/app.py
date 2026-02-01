@@ -15,7 +15,17 @@ import PIL.Image
 
 import google.generativeai as genai
 
-# 너가 만든 모듈들
+# =========================
+# Optional: Groq client
+# =========================
+GROQ_AVAILABLE = False
+try:
+    from groq import Groq  # pip install groq
+    GROQ_AVAILABLE = True
+except Exception:
+    GROQ_AVAILABLE = False
+
+# 너가 만든 모듈들 (RAG)
 try:
     from rag_index import rag_retrieve
     from query_builder import analysis_to_query
@@ -30,7 +40,7 @@ except Exception as e:
     def analysis_to_query(analysis: dict):
         return "home repair issue"
 
-# Llama reasoning pipeline (new)
+# Llama reasoning pipeline (existing)
 try:
     from reasoner import refine_observation_and_build_query
     from planner import generate_fix_plan
@@ -39,8 +49,6 @@ try:
     print("✅ Llama reasoning pipeline loaded")
 except Exception as e:
     print(f"⚠️ Llama pipeline import failed: {e}")
-    print("   Make sure to install: pip install groq")
-    print("   And set GROQ_API_KEY in .env")
     LLAMA_ENABLED = False
 
 
@@ -65,6 +73,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY. Put it in backend/.env or export it.")
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-70b-versatile")  # change if needed
+
 # ----------------------------
 # Redis connection (fallback to in-memory)
 # ----------------------------
@@ -74,7 +85,6 @@ status_by_session: Dict[str, str] = {}
 last_call_by_session: Dict[str, float] = {}
 last_hash_by_session: Dict[str, str] = {}
 
-# Guide fallback memory
 guide_state_by_session: Dict[str, dict] = {}
 
 try:
@@ -117,6 +127,18 @@ app.add_middleware(
 # ----------------------------
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash")
+
+# ----------------------------
+# Groq
+# ----------------------------
+groq_client = None
+if GROQ_AVAILABLE and GROQ_API_KEY:
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        print("✅ Groq client ready")
+    except Exception as e:
+        groq_client = None
+        print("⚠️ Groq client init failed:", e)
 
 # ----------------------------
 # Redis key helpers
@@ -291,7 +313,6 @@ FixtureType = Literal[
 ]
 
 class VisualFlags(BaseModel):
-    # ✅ “갈색 휴지 => clog” 같은 데모용 시그널을 여기에 담음
     tissue_visible: bool = False
     brown_tissue_visible: bool = False
     standing_water_visible: bool = False
@@ -309,12 +330,10 @@ class ProspectedIssue(BaseModel):
     category: str
 
 class HomeIssueExtraction(BaseModel):
-    # ✅ 라우팅 핵심
     fixture_type: FixtureType
     fixture_type_confidence: float = Field(ge=0.0, le=1.0)
     visual_flags: VisualFlags
 
-    # 기존 필드
     no_issue_detected: bool = False
     prospected_issues: list[ProspectedIssue] = Field(min_length=3, max_length=3)
     overall_danger_level: str = Field(pattern="^(low|medium|high)$")
@@ -560,7 +579,7 @@ def make_guide_overlay_payload(st: Optional[GuideState]) -> Optional[dict]:
     }
 
 # ============================================================
-# ✅ 3) Non-toilet: 바로 LLM로 quick steps 생성
+# ✅ 3) Non-toilet quick steps (Gemini fallback)
 # ============================================================
 
 class QuickStepsResponse(BaseModel):
@@ -619,26 +638,18 @@ async def generate_quick_steps(analysis: dict) -> QuickStepsResponse:
     )
 
 # ============================================================
-# ✅ 4) Toilet “brown tissue => clogged” 서버 강제 override
+# ✅ 4) Toilet “brown tissue => clogged” server 강제 override
 # ============================================================
 
 def apply_toilet_demo_overrides(parsed_dict: dict) -> dict:
-    """
-    fixture_type==toilet & brown_tissue_visible==true -> 무조건 clog로 확정
-    """
     try:
         ft = str(parsed_dict.get("fixture_type", "unknown"))
         flags = parsed_dict.get("visual_flags") or {}
         brown = bool(flags.get("brown_tissue_visible", False))
         if ft == "toilet" and brown:
-            # no_issue_detected는 false로
             parsed_dict["no_issue_detected"] = False
-
-            # water_present는 "대개 있을 가능성"이 높지만, 여기서는 데모 안정성 위해 true로
-            # (원하면 flags.standing_water_visible 기반으로 바꿔도 됨)
             parsed_dict["water_present"] = True
 
-            # danger는 보통 low~medium. overflow risk이면 medium
             if bool(flags.get("water_near_rim", False)):
                 parsed_dict["overall_danger_level"] = "medium"
                 parsed_dict["requires_shutoff"] = True
@@ -650,10 +661,8 @@ def apply_toilet_demo_overrides(parsed_dict: dict) -> dict:
                 parsed_dict["professional_needed"] = False
                 parsed_dict["immediate_action"] = "Stop flushing. Prepare a flange plunger and try plunging."
 
-            # prospected_issues[0] 강제
             issues = parsed_dict.get("prospected_issues") or []
             if len(issues) != 3:
-                # 혹시 LLM이 망치면 안전하게 3개 재구성
                 issues = [
                     {
                         "rank": 1,
@@ -690,12 +699,146 @@ def apply_toilet_demo_overrides(parsed_dict: dict) -> dict:
                 issues[0]["symptoms_match"] = sm
                 issues[0]["category"] = issues[0].get("category") or "plumbing"
             parsed_dict["prospected_issues"] = issues
-
     except Exception:
-        # override 실패해도 원본 유지
         pass
-
     return parsed_dict
+
+# ============================================================
+# ✅ 5) Better query builder for non-toilet (esp. pipe)
+# ============================================================
+
+def build_rag_query_general(analysis: dict) -> str:
+    """
+    This prevents the system from accidentally using a toilet-biased query.
+    It creates a query that is strongly anchored to the detected fixture + top issue.
+    """
+    fixture_type = str(analysis.get("fixture_type", "unknown")).strip().lower()
+    fixture = str(analysis.get("fixture", "")).strip().lower()
+    location = str(analysis.get("location", "")).strip().lower()
+
+    issues = analysis.get("prospected_issues") or []
+    top_issue = ""
+    top_cause = ""
+    if isinstance(issues, list) and len(issues) > 0 and isinstance(issues[0], dict):
+        top_issue = str(issues[0].get("issue_name", "")).strip().lower()
+        top_cause = str(issues[0].get("suspected_cause", "")).strip().lower()
+
+    symptoms = analysis.get("observed_symptoms") or []
+    if not isinstance(symptoms, list):
+        symptoms = [str(symptoms)]
+
+    flags = analysis.get("visual_flags") or {}
+    leak_visible = bool(flags.get("leak_visible", False))
+    corrosion = bool(flags.get("corrosion_rust_visible", False))
+    water_present = bool(analysis.get("water_present", False))
+
+    # Pipe-specific boost terms
+    boost_terms = []
+    if fixture_type == "pipe" or "pipe" in fixture or "pipe" in top_issue:
+        boost_terms += ["pipe leak", "burst pipe", "water shutoff valve", "leak repair", "temporary patch", "compression fitting"]
+        if leak_visible or water_present:
+            boost_terms += ["active leak", "water damage", "contain leak", "bucket towels"]
+        if corrosion:
+            boost_terms += ["corroded pipe", "pinhole leak", "galvanized pipe"]
+
+    # General fallback
+    base = f"{fixture_type} {fixture} {top_issue} {top_cause} {location}".strip()
+    sym = " ".join([str(s).strip().lower() for s in symptoms[:8] if str(s).strip()])
+
+    query = " | ".join([x for x in [base, sym, " ".join(boost_terms)] if x])
+    # If somehow empty:
+    return query if query else "home repair troubleshooting"
+
+# ============================================================
+# ✅ 6) Groq solution generators (pipe + generic)
+# ============================================================
+
+def _groq_chat(system: str, user: str) -> str:
+    if not groq_client:
+        raise RuntimeError("Groq not configured. Set GROQ_API_KEY and pip install groq.")
+    resp = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+        max_tokens=900,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+def build_pipe_solution_prompt(analysis: dict, citations: list[dict]) -> Tuple[str, str]:
+    system = (
+        "You are FixDad, a cautious home repair assistant. "
+        "You MUST tailor the plan to the detected fixture and issue. "
+        "If this is a pipe leak/broken pipe, prioritize: shutoff, containment, and safe escalation. "
+        "No unsafe instructions (no gas line work, no electrical panel work, no chemical drain cleaners). "
+        "If uncertain, ask for 1 specific next photo/check."
+    )
+    user = f"""
+TASK:
+Generate a safe, step-by-step fix plan for a PIPE issue (leak/burst/broken/corroded).
+
+ANALYSIS_JSON:
+{json.dumps(analysis, ensure_ascii=False, indent=2)}
+
+RETRIEVED_EXCERPTS (may be empty):
+{json.dumps(citations, ensure_ascii=False, indent=2)}
+
+OUTPUT FORMAT (plain text, exact headings):
+1) What I think is happening
+2) Immediate safety (shutoff + containment)
+3) Step-by-step plan (DIY-safe only)
+4) If it fails / escalation
+5) Call maintenance/plumber if
+6) Tools / parts checklist (generic, no brand part numbers)
+""".strip()
+    return system, user
+
+def build_generic_solution_prompt(analysis: dict, citations: list[dict]) -> Tuple[str, str]:
+    system = (
+        "You are FixDad, a cautious home repair assistant. "
+        "Tailor the plan to the detected fixture_type and top issue. "
+        "No dangerous instructions. If risk is high, prioritize shutoff and escalation."
+    )
+    user = f"""
+TASK:
+Generate a safe, step-by-step fix plan that matches the detected fixture/issue.
+
+ANALYSIS_JSON:
+{json.dumps(analysis, ensure_ascii=False, indent=2)}
+
+RETRIEVED_EXCERPTS (may be empty):
+{json.dumps(citations, ensure_ascii=False, indent=2)}
+
+OUTPUT FORMAT:
+1) What I think is happening
+2) Danger check
+3) Step-by-step DIY plan
+4) If it fails (escalation)
+5) Call a pro if
+6) Tools/parts checklist
+""".strip()
+    return system, user
+
+async def groq_solution_text_for_pipe(analysis: dict) -> Tuple[str, list[dict], str]:
+    # Build a pipe-focused query so RAG doesn't drift to toilet
+    query = build_rag_query_general(analysis)
+    passages_raw = rag_retrieve(query, top_k=6) if RAG_ENABLED else []
+    citations = normalize_passages(passages_raw)
+
+    system, user = build_pipe_solution_prompt(analysis, citations)
+    text = await asyncio.to_thread(_groq_chat, system, user)
+    return text, citations, query
+
+async def groq_solution_text_generic(analysis: dict) -> Tuple[str, list[dict], str]:
+    query = build_rag_query_general(analysis)
+    passages_raw = rag_retrieve(query, top_k=6) if RAG_ENABLED else []
+    citations = normalize_passages(passages_raw)
+
+    system, user = build_generic_solution_prompt(analysis, citations)
+    text = await asyncio.to_thread(_groq_chat, system, user)
+    return text, citations, query
 
 # ============================================================
 # Debug endpoints
@@ -766,7 +909,7 @@ async def analyze_frame(
         except Exception as e:
             return {"success": False, "error": f"Bad image: {str(e)}", "session_id": session_id}
 
-        # ✅ (A) First LLM call: image -> JSON (fixture_type 포함)
+        # (A) First LLM call: image -> JSON (fixture_type 포함)
         try:
             resp = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -796,21 +939,18 @@ async def analyze_frame(
 
         parsed_dict = parsed.model_dump()
 
-        # ✅ (B) Toilet demo hard rule override
+        # (B) Toilet demo hard rule override
         parsed_dict = apply_toilet_demo_overrides(parsed_dict)
 
-        # 저장
+        # Save
         store_analysis(session_id, parsed_dict, raw_response=raw_text[:4000])
 
         fixture_type = str(parsed_dict.get("fixture_type", "unknown"))
         guide_overlay = None
         quick_steps = None
 
-        # ✅ (C) Routing
-        # - toilet -> guide overlay 제공(데모 안정)
-        # - non-toilet -> quick steps 바로 생성해서 리턴
+        # (C) Routing: toilet -> guide overlay, else -> quick steps (for UI)
         if fixture_type == "toilet":
-            # guide state 있으면 overlay 반영
             st = load_guide_state(session_id)
             if st and st.active and st.status in ("active", "paused"):
                 if is_danger_escalation(parsed_dict):
@@ -836,9 +976,7 @@ async def analyze_frame(
                 st.last_updated = time.time()
                 save_guide_state(session_id, st)
                 guide_overlay = make_guide_overlay_payload(st)
-
         else:
-            # non-toilet -> 즉시 step-by-step 생성
             try:
                 qs = await generate_quick_steps(parsed_dict)
                 quick_steps = qs.model_dump()
@@ -888,6 +1026,9 @@ async def health_check():
         "storage": "redis" if USE_REDIS else "in-memory",
         "redis_host": f"{REDIS_HOST}:{REDIS_PORT}",
         "redis_db": REDIS_DB,
+        "groq_enabled": bool(groq_client),
+        "llama_pipeline_enabled": LLAMA_ENABLED,
+        "rag_enabled": RAG_ENABLED,
     }
 
 # ============================================================
@@ -909,7 +1050,6 @@ async def guide_init(req: GuideInitRequest):
     if not analysis or not isinstance(analysis, dict):
         return {"success": False, "error": "Latest analysis missing data", "session_id": session_id}
 
-    # ✅ toilet일 때만 guide 사용
     if str(analysis.get("fixture_type", "unknown")) != "toilet":
         return {"success": False, "error": "Guide is enabled only for toilet demo. Use quick_steps for other fixtures.", "session_id": session_id}
 
@@ -1119,7 +1259,7 @@ async def guide_next(req: GuideNextRequest):
     }
 
 # ============================================================
-# RAG Solution endpoint (optional, 그대로 유지)
+# ✅ Solution endpoint: ROUTE BY fixture_type
 # ============================================================
 
 class SolutionRequest(BaseModel):
@@ -1127,25 +1267,10 @@ class SolutionRequest(BaseModel):
 
 @app.post("/solution")
 async def generate_solution(req: SolutionRequest):
-    """
-    Generate structured fix plan using Llama reasoning pipeline.
-
-    New flow (with Llama):
-    [1] Vision LLM → Observation JSON (already done in /frame)
-    [2] Llama Reasoner ① → Refine JSON, assess risk, generate query
-    [3] RAG (FAISS) → Retrieve repair manuals (if needed)
-    [4] Llama Reasoner ② → Structured fix plan with citation tracking
-    [5] Return to frontend
-
-    This ensures validity, reproducibility, and leverages deterministic behavior.
-    """
     session_id = req.session_id
     t0_total = time.time()
     stage_latencies = {}
 
-    # ============================================================
-    # [1] Get latest analysis (Vision model output from /frame)
-    # ============================================================
     latest_item = get_latest(session_id)
     if not latest_item:
         return {"success": False, "error": "No analysis found for session", "session_id": session_id}
@@ -1154,180 +1279,201 @@ async def generate_solution(req: SolutionRequest):
     if not analysis or not isinstance(analysis, dict):
         return {"success": False, "error": "Latest analysis missing data", "session_id": session_id}
 
-    print(f"\n{'='*60}")
-    print(f"[Solution Pipeline] Starting for session {session_id}")
-    print(f"{'='*60}")
+    fixture_type = str(analysis.get("fixture_type", "unknown")).lower()
 
-    # ============================================================
-    # [2] Llama Reasoner ① - Refine JSON and generate query
-    # ============================================================
-    if not LLAMA_ENABLED:
-        # Fallback to old Gemini-only pipeline
-        return await _legacy_gemini_solution(req, analysis, session_id)
-
-    t0 = time.time()
-    print(f"[Stage 1/3] Calling Llama Reasoner ① for JSON refinement...")
-    success, reasoner_output, error = refine_observation_and_build_query(analysis, session_id)
-    stage_latencies["reasoner1_ms"] = (time.time() - t0) * 1000
-
-    if not success or not reasoner_output:
-        print(f"❌ [Stage 1/3] Reasoner ① failed: {error}")
-        return {
-            "success": False,
-            "session_id": session_id,
-            "error": error or "Reasoner ① failed",
-            "error_stage": "reasoner1",
-            "stage_latencies": stage_latencies,
-        }
-
-    print(f"✅ [Stage 1/3] Reasoner ① completed in {stage_latencies['reasoner1_ms']:.0f}ms")
-    print(f"   Refined issue: {reasoner_output.refined_issue}")
-    print(f"   Risk: {reasoner_output.risk_assessment.level}")
-    print(f"   RAG needed: {reasoner_output.requires_rag}")
-
-    # ============================================================
-    # [3] RAG Retrieval (if needed)
-    # ============================================================
-    retrieved_docs = []
-    retrieval_metrics = None
-
-    if reasoner_output.requires_rag:
+    # ------------------------------------------------------------
+    # (A) TOILET: keep your existing Llama pipeline (demo)
+    # ------------------------------------------------------------
+    if fixture_type == "toilet" and LLAMA_ENABLED:
         t0 = time.time()
-        print(f"[Stage 2/3] RAG retrieval with query: '{reasoner_output.rag_query}'")
+        success, reasoner_output, error = refine_observation_and_build_query(analysis, session_id)
+        stage_latencies["reasoner1_ms"] = (time.time() - t0) * 1000
 
-        try:
-            # Use reasoner's optimized semantic query
-            passages_raw = rag_retrieve(reasoner_output.rag_query, top_k=6)
-            retrieved_docs = normalize_passages(passages_raw)
+        if not success or not reasoner_output:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "error": error or "Reasoner ① failed",
+                "error_stage": "reasoner1",
+                "stage_latencies": stage_latencies,
+            }
 
-            # Calculate vector retrieval metrics for statistical analysis
-            if retrieved_docs:
-                scores = [d.get("score") for d in retrieved_docs if d.get("score") is not None]
-                retrieval_metrics = VectorRetrievalMetrics(
-                    avg_similarity_score=sum(scores) / len(scores) if scores else None,
-                    min_similarity_score=min(scores) if scores else None,
-                    max_similarity_score=max(scores) if scores else None,
-                    num_docs_retrieved=len(retrieved_docs),
-                    retrieval_latency_ms=(time.time() - t0) * 1000,
-                )
+        retrieved_docs = []
+        retrieval_metrics = None
 
-                print(f"✅ [Stage 2/3] Retrieved {len(retrieved_docs)} docs in {retrieval_metrics.retrieval_latency_ms:.0f}ms")
-                if retrieval_metrics.avg_similarity_score:
-                    print(f"   Avg similarity: {retrieval_metrics.avg_similarity_score:.3f}")
-            else:
-                print(f"⚠️ [Stage 2/3] No documents retrieved (query may be too specific)")
+        if reasoner_output.requires_rag:
+            t0 = time.time()
+            try:
+                passages_raw = rag_retrieve(reasoner_output.rag_query, top_k=6) if RAG_ENABLED else []
+                retrieved_docs = normalize_passages(passages_raw)
 
-        except Exception as e:
-            print(f"⚠️ [Stage 2/3] RAG retrieval failed: {str(e)}")
-            # Continue without docs (planner will use fallback mode)
+                if retrieved_docs:
+                    scores = [d.get("score") for d in retrieved_docs if d.get("score") is not None]
+                    retrieval_metrics = VectorRetrievalMetrics(
+                        avg_similarity_score=sum(scores) / len(scores) if scores else None,
+                        min_similarity_score=min(scores) if scores else None,
+                        max_similarity_score=max(scores) if scores else None,
+                        num_docs_retrieved=len(retrieved_docs),
+                        retrieval_latency_ms=(time.time() - t0) * 1000,
+                    )
+            except Exception:
+                pass
+            stage_latencies["rag_ms"] = (time.time() - t0) * 1000
+        else:
+            stage_latencies["rag_ms"] = 0.0
 
-        stage_latencies["rag_ms"] = (time.time() - t0) * 1000
-    else:
-        print(f"[Stage 2/3] Skipping RAG (not required for this issue)")
-        stage_latencies["rag_ms"] = 0.0
+        t0 = time.time()
+        success, fix_plan, error = generate_fix_plan(
+            reasoner_output=reasoner_output,
+            retrieved_docs=retrieved_docs,
+            retrieval_metrics=retrieval_metrics,
+            session_id=session_id,
+        )
+        stage_latencies["planner_ms"] = (time.time() - t0) * 1000
 
-    # ============================================================
-    # [4] Llama Reasoner ② - Generate structured fix plan
-    # ============================================================
-    t0 = time.time()
-    print(f"[Stage 3/3] Calling Llama Planner (Reasoner ②) for fix plan generation...")
-    success, fix_plan, error = generate_fix_plan(
-        reasoner_output=reasoner_output,
-        retrieved_docs=retrieved_docs,
-        retrieval_metrics=retrieval_metrics,
-        session_id=session_id,
-    )
-    stage_latencies["planner_ms"] = (time.time() - t0) * 1000
+        if not success or not fix_plan:
+            return {
+                "success": False,
+                "session_id": session_id,
+                "error": error or "Planner failed",
+                "error_stage": "planner",
+                "reasoner_output": reasoner_output.model_dump() if reasoner_output else None,
+                "stage_latencies": stage_latencies,
+            }
 
-    if not success or not fix_plan:
-        print(f"❌ [Stage 3/3] Planner failed: {error}")
+        total_latency_ms = (time.time() - t0_total) * 1000
+        stage_latencies["total_ms"] = total_latency_ms
+
+        if USE_REDIS:
+            solution_data = {
+                "reasoner_output": reasoner_output.model_dump(),
+                "fix_plan": fix_plan.model_dump(),
+                "timestamp": time.time(),
+            }
+            redis_client.set(k_solution_latest(session_id), json.dumps(solution_data), ex=REDIS_TTL_SECONDS)
+
         return {
-            "success": False,
+            "success": True,
             "session_id": session_id,
-            "error": error or "Planner (Reasoner ②) failed",
-            "error_stage": "reasoner2",
-            "reasoner_output": reasoner_output.model_dump() if reasoner_output else None,
-            "stage_latencies": stage_latencies,
-        }
-
-    print(f"✅ [Stage 3/3] Planner completed in {stage_latencies['planner_ms']:.0f}ms")
-    print(f"   Steps generated: {len(fix_plan.steps)}")
-    print(f"   Confidence: {fix_plan.statistical_metrics.confidence:.2f}")
-    print(f"   Citation coverage: {fix_plan.citation_tracker.citation_coverage:.2f}")
-    print(f"   Hallucination risk: {fix_plan.citation_tracker.hallucination_risk_score:.2f}")
-
-    # ============================================================
-    # [5] Save to Redis and return
-    # ============================================================
-    total_latency_ms = (time.time() - t0_total) * 1000
-    stage_latencies["total_ms"] = total_latency_ms
-
-    print(f"\n{'='*60}")
-    print(f"[Solution Pipeline] Completed in {total_latency_ms:.0f}ms")
-    print(f"  Reasoner ①: {stage_latencies['reasoner1_ms']:.0f}ms")
-    print(f"  RAG:        {stage_latencies.get('rag_ms', 0):.0f}ms")
-    print(f"  Planner:    {stage_latencies['planner_ms']:.0f}ms")
-    print(f"{'='*60}\n")
-
-    if USE_REDIS:
-        solution_data = {
             "reasoner_output": reasoner_output.model_dump(),
             "fix_plan": fix_plan.model_dump(),
-            "timestamp": time.time(),
+            "query": reasoner_output.rag_query,
+            "citations": retrieved_docs,
+            "solution": fix_plan.summary,
+            "stage_latencies": stage_latencies,
+            "total_latency_ms": total_latency_ms,
+            "routed_mode": "toilet_llama_pipeline",
         }
-        redis_client.set(
-            k_solution_latest(session_id),
-            json.dumps(solution_data),
-            ex=REDIS_TTL_SECONDS,
-        )
 
-    # Return structured response (with legacy fields for backward compatibility)
-    return {
-        "success": True,
-        "session_id": session_id,
+    # ------------------------------------------------------------
+    # (B) PIPE: force a pipe-specific Groq plan (fixes your issue)
+    # ------------------------------------------------------------
+    if fixture_type == "pipe":
+        # Prefer Groq for pipe; if not available, fallback to Gemini legacy
+        if groq_client:
+            try:
+                t0 = time.time()
+                solution_text, citations, query = await groq_solution_text_for_pipe(analysis)
+                stage_latencies["groq_ms"] = (time.time() - t0) * 1000
 
-        # New structured fields (Llama pipeline)
-        "reasoner_output": reasoner_output.model_dump(),
-        "fix_plan": fix_plan.model_dump(),
+                total_latency_ms = (time.time() - t0_total) * 1000
+                stage_latencies["total_ms"] = total_latency_ms
 
-        # Legacy fields (for backward compatibility with frontend)
-        "query": reasoner_output.rag_query,
-        "citations": retrieved_docs,
-        "solution": fix_plan.summary,  # Simple text summary
+                if USE_REDIS:
+                    redis_client.set(
+                        k_solution_latest(session_id),
+                        json.dumps(
+                            {
+                                "mode": "pipe_groq",
+                                "query": query,
+                                "citations": citations,
+                                "solution": solution_text,
+                                "timestamp": time.time(),
+                            }
+                        ),
+                        ex=REDIS_TTL_SECONDS,
+                    )
 
-        # Performance metrics
-        "stage_latencies": stage_latencies,
-        "total_latency_ms": total_latency_ms,
-    }
+                return {
+                    "success": True,
+                    "session_id": session_id,
+                    "query": query,
+                    "citations": citations,
+                    "solution": solution_text,
+                    "stage_latencies": stage_latencies,
+                    "total_latency_ms": total_latency_ms,
+                    "routed_mode": "pipe_groq",
+                }
+            except Exception as e:
+                # fall through to legacy below
+                stage_latencies["groq_error"] = str(e)[:140]
 
+        # Gemini fallback (pipe-specific query!)
+        return await _legacy_gemini_solution(req, analysis, session_id, forced_query=build_rag_query_general(analysis), routed_mode="pipe_gemini_fallback")
+
+    # ------------------------------------------------------------
+    # (C) OTHER fixture types: Groq generic if possible, else Gemini legacy
+    # ------------------------------------------------------------
+    if groq_client:
+        try:
+            t0 = time.time()
+            solution_text, citations, query = await groq_solution_text_generic(analysis)
+            stage_latencies["groq_ms"] = (time.time() - t0) * 1000
+
+            total_latency_ms = (time.time() - t0_total) * 1000
+            stage_latencies["total_ms"] = total_latency_ms
+
+            if USE_REDIS:
+                redis_client.set(
+                    k_solution_latest(session_id),
+                    json.dumps(
+                        {
+                            "mode": "generic_groq",
+                            "query": query,
+                            "citations": citations,
+                            "solution": solution_text,
+                            "timestamp": time.time(),
+                        }
+                    ),
+                    ex=REDIS_TTL_SECONDS,
+                )
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "query": query,
+                "citations": citations,
+                "solution": solution_text,
+                "stage_latencies": stage_latencies,
+                "total_latency_ms": total_latency_ms,
+                "routed_mode": "generic_groq",
+            }
+        except Exception as e:
+            stage_latencies["groq_error"] = str(e)[:140]
+
+    return await _legacy_gemini_solution(req, analysis, session_id, forced_query=build_rag_query_general(analysis), routed_mode="generic_gemini")
 
 # ============================================================
-# Legacy Gemini-only solution (fallback if Llama not available)
+# Legacy Gemini-only solution (fallback)
+# (Now supports forced_query so pipe doesn't drift to toilet.)
 # ============================================================
 
-async def _legacy_gemini_solution(req: SolutionRequest, analysis: dict, session_id: str):
-    """
-    Legacy solution generation using only Gemini (no Llama reasoning).
-    Used as fallback when Llama pipeline is not available.
-    """
-    print("⚠️ Using legacy Gemini-only solution (Llama not available)")
+async def _legacy_gemini_solution(req: SolutionRequest, analysis: dict, session_id: str, forced_query: Optional[str] = None, routed_mode: str = "legacy_gemini"):
+    try:
+        query = forced_query or analysis_to_query(analysis)
+    except Exception:
+        query = forced_query or build_rag_query_general(analysis)
 
     try:
-        query = analysis_to_query(analysis)
-    except Exception as e:
-        return {"success": False, "error": f"analysis_to_query error: {str(e)}", "session_id": session_id}
-
-    try:
-        passages_raw = rag_retrieve(query, top_k=6)
-    except Exception as e:
-        return {"success": False, "error": f"rag_retrieve error: {str(e)}", "session_id": session_id}
+        passages_raw = rag_retrieve(query, top_k=6) if RAG_ENABLED else []
+    except Exception:
+        passages_raw = []
 
     citations = normalize_passages(passages_raw)
 
     prompt = f"""
 You are FixDad, a careful home repair assistant.
-Use the analysis JSON and the retrieved manual excerpts to produce a safe, step-by-step plan.
-If there is danger, prioritize shutoff and calling a professional.
+Tailor your answer to the detected fixture_type and top issue. Do NOT default to toilet steps.
 
 ANALYSIS_JSON:
 {json.dumps(analysis, ensure_ascii=False, indent=2)}
@@ -1347,6 +1493,7 @@ Rules:
 - Be specific and grounded in the excerpts.
 - If you are unsure, say what to inspect next.
 - Do not invent brand/model part names.
+- No chemical drain cleaners.
 """.strip()
 
     try:
@@ -1370,6 +1517,7 @@ Rules:
         "query": query,
         "citations": citations,
         "solution": solution_text,
+        "routed_mode": routed_mode,
     }
 
 if __name__ == "__main__":
