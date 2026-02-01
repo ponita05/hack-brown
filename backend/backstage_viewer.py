@@ -10,6 +10,7 @@ A local-only "backstage" dashboard that explains how data flows through your sys
     /history/{session_id}?limit=...
     /guide/state/{session_id}        (optional; if exists)
     /solution/latest/{session_id}    (optional; if you add it)
+    /voice/latest/{session_id}       (optional; if you add it for TTS)
     /debug/events/{session_id}       (optional; if you add event logging)
 
 USAGE:
@@ -27,7 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -146,11 +147,6 @@ HTML = r"""
       padding: 12px;
     }
     .row { display: flex; gap: 8px; flex-wrap: wrap; }
-    .k {
-      font-size: 11px;
-      color: rgba(255,255,255,0.65);
-      font-family: var(--mono);
-    }
     .v {
       font-size: 12px;
       color: rgba(255,255,255,0.92);
@@ -233,6 +229,12 @@ HTML = r"""
       cursor: pointer;
     }
     button:hover { background: rgba(255,255,255,0.08); }
+    audio {
+      width: 100%;
+      margin-top: 6px;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.2);
+    }
   </style>
 </head>
 
@@ -270,6 +272,7 @@ HTML = r"""
               <br/>• Vision result → stored as <span class="v">latest</span> and appended to <span class="v">history</span>
               <br/>• Guided Fix state (toilet demo) → stored as <span class="v">guide:state</span>
               <br/>• Solution pipeline → stored as <span class="v">solution:latest</span> (if enabled)
+              <br/>• Voice/TTS → stored as <span class="v">voice:latest</span> (if enabled)
             </div>
           </div>
 
@@ -324,10 +327,10 @@ HTML = r"""
       </div>
     </section>
 
-    <!-- RIGHT: Solution / Guide / Events -->
+    <!-- RIGHT: Solution / Voice / Guide / Events -->
     <section class="card">
       <div class="hd">
-        <div class="h">RAG + Groq Output</div>
+        <div class="h">RAG + GROQ OUTPUT</div>
         <div class="small" id="rightStatus"></div>
       </div>
       <div class="bd">
@@ -337,6 +340,24 @@ HTML = r"""
             <div class="tag" id="solutionTag">optional</div>
           </div>
           <pre id="solutionText">If your backend has /solution/latest/{session_id}, it will appear here.</pre>
+        </div>
+
+        <div style="height:10px"></div>
+
+        <div class="item">
+          <div class="top">
+            <div class="t">Voice (TTS) snapshot</div>
+            <div class="tag" id="voiceTag">optional</div>
+          </div>
+
+          <div class="row" style="align-items:center; gap:10px; margin-bottom:8px;">
+            <button id="playVoice">play</button>
+            <button id="stopVoice">stop</button>
+            <span class="small" id="voiceAge"></span>
+          </div>
+
+          <audio id="voicePlayer" controls></audio>
+          <pre id="voiceText">If your backend has /voice/latest/{session_id}, it will appear here.</pre>
         </div>
 
         <div style="height:10px"></div>
@@ -373,7 +394,6 @@ HTML = r"""
 
   const POLL_MS = 600;
   const pretty = (obj) => JSON.stringify(obj, null, 2);
-
   const el = (id) => document.getElementById(id);
 
   el("backendUrl").textContent = backend;
@@ -406,6 +426,33 @@ HTML = r"""
     if (level === "high") tag.classList.add("bad");
     else if (level === "medium") tag.classList.add("warn");
     else tag.classList.add("ok");
+  }
+
+  let lastVoiceObjectUrl = null;
+
+  function setVoiceAudioFromBase64(b64, mime) {
+    try {
+      if (!b64) return false;
+      if (!mime) mime = "audio/mpeg";
+
+      // Allow payloads that include "data:audio/mpeg;base64,...."
+      const cleaned = b64.includes("base64,") ? b64.split("base64,").pop() : b64;
+
+      const bytes = Uint8Array.from(atob(cleaned), c => c.charCodeAt(0));
+      const blob = new Blob([bytes], { type: mime });
+      const url = URL.createObjectURL(blob);
+
+      if (lastVoiceObjectUrl) {
+        try { URL.revokeObjectURL(lastVoiceObjectUrl); } catch (_) {}
+      }
+      lastVoiceObjectUrl = url;
+
+      const player = el("voicePlayer");
+      player.src = url;
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   async function pollOnce() {
@@ -478,12 +525,74 @@ HTML = r"""
     } else {
       solTag.textContent = "optional";
       solTag.className = "tag";
-      // keep text if endpoint missing
       if (sol.__error && String(sol.__error).includes("HTTP 404")) {
         el("solutionText").textContent =
           "Endpoint not found. Add /solution/latest/{session_id} if you want this snapshot.";
       } else if (sol.__error && String(sol.__error).includes("HTTP")) {
         el("solutionText").textContent = pretty(sol);
+      }
+    }
+
+    // Optional: voice/latest
+    const voiceSnap = await safeFetchJson(`${backend}/voice/latest/${sessionId}`);
+    const voiceTag = el("voiceTag");
+
+    // Supported shapes:
+    // (A) { success:true, voice_snapshot:{ timestamp, source, voice:{ text, voice_id, mime, audio_base64, error } } }
+    // (B) { success:true, timestamp, source, text, voice_id, mime, audio_base64, error }
+    let vs = null;
+    if (!voiceSnap.__error && voiceSnap.success !== false) {
+      if (voiceSnap.voice_snapshot) {
+        const inner = voiceSnap.voice_snapshot || {};
+        const payload = inner.voice || {};
+        vs = {
+          timestamp: inner.timestamp,
+          source: inner.source,
+          ...payload
+        };
+      } else {
+        vs = {
+          timestamp: voiceSnap.timestamp,
+          source: voiceSnap.source,
+          text: voiceSnap.text,
+          voice_id: voiceSnap.voice_id,
+          mime: voiceSnap.mime,
+          audio_base64: voiceSnap.audio_base64,
+          error: voiceSnap.error
+        };
+      }
+    }
+
+    if (vs && (vs.audio_base64 || vs.text || vs.error)) {
+      voiceTag.textContent = "present";
+      voiceTag.className = "tag ok";
+      el("voiceAge").textContent = vs.timestamp ? `updated: ${fmtAgeSeconds(vs.timestamp)}` : "";
+
+      el("voiceText").textContent = pretty({
+        timestamp: vs.timestamp,
+        source: vs.source,
+        mime: vs.mime,
+        voice_id: vs.voice_id,
+        text: vs.text,
+        error: vs.error
+      });
+
+      if (vs.audio_base64) {
+        setVoiceAudioFromBase64(vs.audio_base64, vs.mime || "audio/mpeg");
+      }
+    } else {
+      voiceTag.textContent = "optional";
+      voiceTag.className = "tag";
+      el("voiceAge").textContent = "";
+
+      if (voiceSnap.__error && String(voiceSnap.__error).includes("HTTP 404")) {
+        el("voiceText").textContent =
+          "Endpoint not found. Add /voice/latest/{session_id} if you want audio playback here.";
+      } else if (voiceSnap.__error && String(voiceSnap.__error).includes("HTTP")) {
+        el("voiceText").textContent = pretty(voiceSnap);
+      } else {
+        // endpoint exists but no data
+        el("voiceText").textContent = pretty(voiceSnap);
       }
     }
 
@@ -505,6 +614,8 @@ HTML = r"""
       if (guide.__error && String(guide.__error).includes("HTTP 404")) {
         el("guideText").textContent =
           "Endpoint not found. If you use Guided Fix, /guide/state/{session_id} will show here.";
+      } else if (guide.__error && String(guide.__error).includes("HTTP")) {
+        el("guideText").textContent = pretty(guide);
       }
     }
 
@@ -521,6 +632,8 @@ HTML = r"""
       if (events.__error && String(events.__error).includes("HTTP 404")) {
         el("eventsText").textContent =
           "Endpoint not found. If you add an event log, you can show a live transaction trace here.";
+      } else if (events.__error && String(events.__error).includes("HTTP")) {
+        el("eventsText").textContent = pretty(events);
       }
     }
 
@@ -535,6 +648,16 @@ HTML = r"""
   }
 
   el("forceRefresh").addEventListener("click", pollOnce);
+
+  el("playVoice").addEventListener("click", () => {
+    const p = el("voicePlayer");
+    if (p && p.src) p.play();
+  });
+  el("stopVoice").addEventListener("click", () => {
+    const p = el("voicePlayer");
+    if (p) { p.pause(); p.currentTime = 0; }
+  });
+
   startPolling();
 </script>
 </body>
@@ -543,23 +666,20 @@ HTML = r"""
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # Embed config safely into the page
     cfg = {
         "backend_url": CONFIG["backend_url"].rstrip("/"),
         "session_id": CONFIG["session_id"],
         "viewer_started_at": CONFIG["viewer_started_at"],
     }
-    injected = (
-        "<script>window.__BACKSTAGE_CONFIG__ = "
-        + json.dumps(cfg)
-        + ";</script>"
-    )
+    injected = "<script>window.__BACKSTAGE_CONFIG__ = " + json.dumps(cfg) + ";</script>"
     html = HTML.replace("</head>", injected + "\n</head>")
     return HTMLResponse(content=html)
+
 
 @app.get("/config")
 async def config():
     return JSONResponse(CONFIG)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -575,6 +695,7 @@ def main():
 
     # Local only: bind to 127.0.0.1 so it cannot be accessed from other machines
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
+
 
 if __name__ == "__main__":
     main()

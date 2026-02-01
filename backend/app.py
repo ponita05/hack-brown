@@ -1,12 +1,12 @@
+# app.py
 import os
 import io
 import json
 import time
 import asyncio
 import hashlib
+import base64
 from typing import Optional, Any, Dict, List, Literal, Tuple
-from fastapi.responses import Response, JSONResponse
-
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,10 +66,24 @@ except Exception as e:
     print(f"⚠️ ElevenLabs import failed: {e}")
     ELEVENLABS_AVAILABLE = False
 
-
+# Load env first, then read keys
 load_dotenv()
 
 app = FastAPI()
+
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+
+# Default voice id (your "dad" voice) — fallback hardcoded
+DEFAULT_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "bIHbv24MWmeRgasZH58o").strip()
+DEFAULT_TTS_MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5").strip()
+
+print(
+    "🔊 ElevenLabs configured:",
+    "sdk=", ELEVENLABS_AVAILABLE,
+    "api_key=", bool(ELEVENLABS_API_KEY),
+    "default_voice_id=", DEFAULT_VOICE_ID,
+    "tts_model_id=", DEFAULT_TTS_MODEL_ID
+)
 
 # ----------------------------
 # Config
@@ -84,14 +98,15 @@ REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "20"))
 
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "30"))
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY. Put it in backend/.env or export it.")
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-70b-versatile")  # change if needed
+# ✅ 안정 모델 기본값 (필요하면 .env에서 GEMINI_MODEL 바꿔서 테스트)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-2.0-flash"
 
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-70b-versatile").strip()
 
 # ----------------------------
 # Redis connection (fallback to in-memory)
@@ -103,6 +118,8 @@ last_call_by_session: Dict[str, float] = {}
 last_hash_by_session: Dict[str, str] = {}
 
 guide_state_by_session: Dict[str, dict] = {}
+notes_by_session: Dict[str, List[dict]] = {}
+
 
 try:
     redis_client = redis.Redis(
@@ -143,7 +160,8 @@ app.add_middleware(
 # Gemini
 # ----------------------------
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
+print("🤖 Gemini model:", GEMINI_MODEL)
+model = genai.GenerativeModel(GEMINI_MODEL)
 
 # ----------------------------
 # Groq
@@ -312,6 +330,68 @@ def normalize_passages(passages: Any) -> List[Dict[str, Any]]:
     return [{"rank": 1, "score": None, "text": str(passages), "source": "docs"}]
 
 # ============================================================
+# ✅ ElevenLabs helper: bytes + base64 packaging
+# ============================================================
+
+def _eleven_client() -> Optional["ElevenLabs"]:
+    if not (ELEVENLABS_AVAILABLE and ELEVENLABS_API_KEY):
+        return None
+    try:
+        return ElevenLabs(api_key=ELEVENLABS_API_KEY)
+    except Exception:
+        return None
+
+def resolve_voice_id(user_voice_id: Optional[str]) -> str:
+    v = (user_voice_id or "").strip()
+    return v if v else DEFAULT_VOICE_ID
+
+def tts_bytes(text: str, voice_id: Optional[str] = None) -> bytes:
+    """
+    Generates MP3 bytes via ElevenLabs.
+    Raises on failure.
+    """
+    client = _eleven_client()
+    if not client:
+        raise RuntimeError("ElevenLabs not configured (missing SDK or ELEVENLABS_API_KEY).")
+
+    vid = voice_id or DEFAULT_VOICE_ID
+
+    audio_generator = client.text_to_speech.convert(
+        text=text,
+        voice_id=vid,
+        model_id=DEFAULT_TTS_MODEL_ID,
+        voice_settings=VoiceSettings(
+            stability=0.5,
+            similarity_boost=0.75,
+            style=0.3,
+            use_speaker_boost=True,
+        ),
+    )
+
+    b = b""
+    for chunk in audio_generator:
+        if chunk:
+            b += chunk
+    return b
+
+def voice_payload_from_text(text: str, voice_id: Optional[str] = None) -> Optional[dict]:
+    """
+    Returns {"mime":"audio/mpeg","audio_base64":"...","voice_id":"..."} or error payload.
+    """
+    try:
+        if not text or not text.strip():
+            return None
+        audio = tts_bytes(text.strip()[:1000], voice_id=voice_id)
+        return {
+            "mime": "audio/mpeg",
+            "voice_id": voice_id or DEFAULT_VOICE_ID,
+            "audio_base64": base64.b64encode(audio).decode("utf-8"),
+            "text": text.strip()[:300],
+        }
+    except Exception as e:
+        return {"error": f"voice_failed: {repr(e)[:180]}"}
+
+# ============================================================
 # ✅ 1) Extraction schema: fixture_type + visual_flags 포함
 # ============================================================
 
@@ -329,17 +409,59 @@ FixtureType = Literal[
     "unknown",
 ]
 
+# ----------------------------
+# Notes (speech / user context)
+# ----------------------------
+
+class NoteIn(BaseModel):
+    session_id: str
+    text: str
+    source: str | None = "web_speech"
+
+def k_notes(session_id: str) -> str:
+    return f"session:{session_id}:notes"
+
+@app.post("/note")
+def add_note(payload: NoteIn):
+    ts = int(time.time() * 1000)
+    item = {"ts": ts, "text": payload.text, "source": payload.source}
+
+    if USE_REDIS:
+        redis_client.rpush(k_notes(payload.session_id), json.dumps(item))
+        redis_client.ltrim(k_notes(payload.session_id), -20, -1)
+        redis_client.expire(k_notes(payload.session_id), REDIS_TTL_SECONDS)
+    else:
+        notes_by_session.setdefault(payload.session_id, []).append(item)
+        notes_by_session[payload.session_id] = notes_by_session[payload.session_id][-20:]
+
+    return {"success": True, "session_id": payload.session_id, "saved": item}
+
+@app.get("/note/latest")
+def get_latest_note(session_id: str):
+    if USE_REDIS:
+        raw = redis_client.lrange(k_notes(session_id), -1, -1)
+        if not raw:
+            return {"success": True, "session_id": session_id, "note": None}
+        return {"success": True, "session_id": session_id, "note": json.loads(raw[0])}
+
+    arr = notes_by_session.get(session_id, [])
+    return {"success": True, "session_id": session_id, "note": (arr[-1] if arr else None)}
+
+
 class VisualFlags(BaseModel):
     human_visible: bool = False
     human_interacting: bool = False
     tissue_visible: bool = False
-    brown_tissue_visible: bool = False
+    brown_water_visible: bool = False
     standing_water_visible: bool = False
     water_near_rim: bool = False
     leak_visible: bool = False
     corrosion_rust_visible: bool = False
     smoke_fire_visible: bool = False
-    toilet_tank_lid_off: bool = False
+    toilet_seat_visible: bool = False
+    toilet_seat_lid_visible: bool = False  # 뚜껑(덮개)
+    toilet_seat_lid_visible: bool = False
+
 
 class ProspectedIssue(BaseModel):
     rank: int = Field(ge=1, le=3)
@@ -367,53 +489,81 @@ class HomeIssueExtraction(BaseModel):
     immediate_action: str
     professional_needed: bool
 
-def build_extraction_prompt() -> str:
-    return """
-You are a home repair expert, but also a nice dad, analyzing ONE image of a household situation.
+def build_extraction_prompt(user_speech: str = "") -> str:
+    user_context = ""
+    if user_speech and user_speech.strip():
+        user_context = f"""
+USER'S SPOKEN CONTEXT (from microphone):
+"{user_speech.strip()}"
 
-Your job:
-(1) Detect if a human being is visible in the frame. When you detect it, say what the object is explicitly. 
-(2) Identify fixture_type (closed set)
-(3) Extract visual_flags (especially tissue + brown tissue)
-(4) Provide a conservative issue JSON
+Use this context to understand symptoms/questions mentioned by the user.
+"""
 
-HUMAN DETECTION (PRIORITY #1):
-- FIRST, check if a human being (person) is visible in the frame, and you don't see any hoome appliances mainly in the screen.
-- If yes, set visual_flags.human_visible=true
-- If the human appears to be working on, examining, or interacting with the fixture, set visual_flags.human_interacting=true
-- Even if a human is present, still analyze for issues normally
-- When the toilet seat cover is missing, whcih means leaving the toilet bowl exposed with visible mounting slots with gray color ,toilet_tank_lid_off: bool = False
+    return f"""
+You are FixDad: a cautious home repair expert (friendly dad tone).
+Analyze ONE image of a household situation.
 
+{user_context}
+
+
+
+TOILET STEP SIGNALS (very important):
+- If you clearly see the toilet seat / lid, set:
+  visual_flags.toilet_seat_visible=true
+  visual_flags.toilet_seat_lid_visible=true (only if lid is visible)
+- If you see brown/dirty water in the bowl, set visual_flags.brown_water_visible=true.
+- If you see a trash can with brown tissues clearly visible, set visual_flags.trash_can_brown_tissue_visible=true.
+
+HARD RULES:
+- If fixture_type=="toilet" AND visual_flags.brown_water_visible==true:
+  Issue #1 must be "Toilet clogged (paper blockage)" with confidence >= 0.85.
+- If fixture_type=="toilet" AND visual_flags.toilet_seat_visible==true AND brown_water_visible==false AND brown_tissue_visible==false:
+  Do NOT mark "no_issue_detected". Instead, keep danger low and set immediate_action to "Be careful and ensure the seat/lid is aligned and stable."
+
+  Goals:
+1) Detect if a human being is visible in the frame.
+- If the user's spoken context clearly states a problem (e.g., "toilet lid broken"), include it in observed_symptoms and reflect it in prospected_issues when consistent with the image.
+
+2) Identify fixture_type (closed set).
+3) Fill visual_flags (including tissue / brown tissue).
+4) Produce a conservative issue JSON.
+
+HUMAN DETECTION:
+- If a person is visible, set visual_flags.human_visible=true
+- If the person seems to be working on/interacting with the fixture, set visual_flags.human_interacting=true
+- Even if a person is visible, still analyze for issues.
 
 IMPORTANT RULES:
 - Clog requires evidence like standing water, water near rim, overflow risk, or clear blockage.
 - If fixture_type == "toilet" and you see the toilet tank open / lid removed / top cover missing, set visual_flags.toilet_tank_lid_off=true.
-- However, for TOILET DEMO PURPOSES ONLY:
+- For TOILET DEMO:
   If you see BROWN TISSUE / BROWN PAPER clumps inside toilet bowl, set visual_flags.brown_tissue_visible=true.
-  If fixture_type == "toilet" AND brown_tissue_visible == true, your #1 issue SHOULD be "Toilet clogged (paper blockage)" with high confidence (>=0.85).
+  If fixture_type == "toilet" AND brown_tissue_visible == true, issue #1 should be "Toilet clogged (paper blockage)" with confidence >= 0.85.
 
-Return ONLY valid JSON matching this exact schema:
-{
+Return ONLY valid JSON matching this exact schema (no markdown, no commentary):
+
+{{
   "fixture_type": "toilet|sink|shower|bathtub|floor_drain|pipe|water_heater|hvac|breaker_panel|appliance|unknown",
   "fixture_type_confidence": 0.0,
-"visual_flags": {
-  "tissue_visible": true|false,
-  "brown_tissue_visible": true|false,
-  "standing_water_visible": true|false,
-  "water_near_rim": true|false,
-  "leak_visible": true|false,
-  "corrosion_rust_visible": true|false,
-  "smoke_fire_visible": true|false,
-  "toilet_tank_lid_off": true|false
-},
-
+  "visual_flags": {{
+    "human_visible": true|false,
+    "human_interacting": true|false,
+    "tissue_visible": true|false,
+    "brown_tissue_visible": true|false,
+    "standing_water_visible": true|false,
+    "water_near_rim": true|false,
+    "leak_visible": true|false,
+    "corrosion_rust_visible": true|false,
+    "smoke_fire_visible": true|false,
+    "toilet_tank_lid_off": true|false
+  }},
   "no_issue_detected": true|false,
   "human_detected": true|false,
   "repair_pending": true|false,
   "prospected_issues": [
-    {"rank": 1, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"},
-    {"rank": 2, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"},
-    {"rank": 3, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"}
+    {{"rank": 1, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"}},
+    {{"rank": 2, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"}},
+    {{"rank": 3, "issue_name": "...", "suspected_cause": "...", "confidence": 0.0, "symptoms_match": ["..."], "category": "plumbing"}}
   ],
   "overall_danger_level": "low|medium|high",
   "location": "...",
@@ -423,25 +573,24 @@ Return ONLY valid JSON matching this exact schema:
   "water_present": true|false,
   "immediate_action": "...",
   "professional_needed": true|false
-}
+}}
 
-STRICT RULES:
-- Output ONLY the JSON object (no markdown, no commentary).
+STRICT:
+- Output ONLY the JSON object.
 - Exactly 3 prospected issues.
 - Confidence 0.0 to 1.0
 - overall_danger_level must be low/medium/high
 
-SPECIAL RULES:
+SPECIAL:
 - If no_issue_detected=true:
   - prospected_issues[0].issue_name must be exactly "No visible issue"
   - overall_danger_level must be "low"
   - requires_shutoff=false, professional_needed=false
-  - immediate_action should say "Looks normal. No action needed."
+  - immediate_action = "Looks normal. No action needed."
   - human_detected=false, repair_pending=false
 
 - If issues exist AND human is visible:
   - Set human_detected=true and repair_pending=true
-  - This indicates someone is working on repairs
 """.strip()
 
 # ============================================================
@@ -488,37 +637,46 @@ TOILET_CLOG_PLAN_ID = "toilet_clog_v1"
 TOILET_CLOG_STEPS: list[GuideStep] = [
     GuideStep(
         step_id=1,
-        title="Stop making it worse",
-        instruction="Stop flushing immediately. If the water is near the rim, do NOT flush again. Watch the water level for 30 seconds.",
-        safety_note="If the water is rising fast, shut off the toilet supply valve (behind the toilet, turn clockwise).",
-        check_hint="Water level is stable (not rising).",
-        is_danger_step=True,
+        title="Remove visible tissues and debris",
+        instruction="Remove all visible tissue and paper from the toilet bowl. Don't flush yet. Use gloves or a tool to safely remove the debris.",
+        safety_note="Wear gloves if available. Dispose of removed tissue in a trash bag.",
+        check_hint="Bowl surface looks clear of loose tissues/paper.",
+        is_danger_step=False,
     ),
     GuideStep(
         step_id=2,
-        title="Plunge correctly",
-        instruction="Use a flange plunger. Make a tight seal, then plunge firmly for 20–30 seconds. Wait 10 seconds to see if it drains.",
-        safety_note="Avoid chemical drain cleaners (splash risk).",
-        check_hint="Water drains down or at least drops.",
+        title="Check toilet seat cover / lid",
+        instruction="Check the toilet seat cover for issues. Confirm it is not loose, cracked, or wobbling. If it is misaligned, align it and tighten the hinges if needed.",
+        safety_note="Avoid pinching fingers near hinges. Don't overtighten plastic hinges.",
+        check_hint="Seat cover looks aligned and stable (no wobble / no visible crack).",
         is_danger_step=False,
     ),
     GuideStep(
         step_id=3,
-        title="Second attempt + stop rule",
-        instruction="Try plunging one more round (15–20 seconds). If still clogged, stop using the toilet and escalate.",
-        safety_note="Repeated flushing increases overflow risk.",
-        check_hint="Still blocked after 2 rounds.",
-        is_danger_step=True,
+        title="Check brown water / water level",
+        instruction="Check the water in the bowl. Look for unusually high water level and brown/dirty water, which can indicate a clog.",
+        safety_note="Avoid splashing. Keep face and hands away from the bowl water.",
+        check_hint="Water level is high and/or brown (clog suspected) OR water level looks normal.",
+        is_danger_step=False,
     ),
     GuideStep(
         step_id=4,
-        title="Escalate safely",
-        instruction="Use a toilet auger (snake) if available. Otherwise stop and call maintenance/plumber. Keep the area dry and don’t flush.",
-        safety_note="If sewage backup/overflow occurs, treat as high-risk and escalate immediately.",
-        check_hint="Auger clears the clog OR you decide to call a pro.",
-        is_danger_step=True,
+        title="Plunge out the clog",
+        instruction="Use a flange plunger to clear the blockage. Make a tight seal, then plunge firmly for 20–30 seconds. Watch if the water drains.",
+        safety_note="Avoid splashing. Keep a good seal with the plunger to create suction.",
+        check_hint="Water drains down or level drops significantly.",
+        is_danger_step=False,
+    ),
+    GuideStep(
+        step_id=5,
+        title="Final clean + confirm normal",
+        instruction="Wipe down surfaces, dry any spills, and test flush once to confirm it's working. Confirm water looks clear and level is normal.",
+        safety_note="Use disinfectant on any surfaces that contacted toilet water.",
+        check_hint="Bathroom is clean/dry and toilet flushes normally with clear water.",
+        is_danger_step=False,
     ),
 ]
+
 
 GUIDE_PLANS: dict[str, list[GuideStep]] = {TOILET_CLOG_PLAN_ID: TOILET_CLOG_STEPS}
 
@@ -595,7 +753,7 @@ def make_guide_overlay_payload(st: Optional[GuideState]) -> Optional[dict]:
             "active": True,
             "type": "done",
             "level": "medium",
-            "message": "✅ Guided Fix completed. If it still doesn’t work, escalate to maintenance/plumber.",
+            "message": "✅ Guided Fix completed. If it still doesn't work, escalate to maintenance/plumber.",
             "plan_id": st.plan_id,
             "focus": st.focus.model_dump(),
             "status": st.status,
@@ -624,14 +782,39 @@ def make_guide_overlay_payload(st: Optional[GuideState]) -> Optional[dict]:
 
 class QuickStepsResponse(BaseModel):
     fixture_type: FixtureType
-    steps: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(min_length=4, max_length=4)      # ✅ 4개 고정
     safety_notes: list[str] = Field(default_factory=list)
     when_to_call_pro: list[str] = Field(default_factory=list)
+    next_photo_request: str | None = None                      # ✅ 불확실하면 딱 1개만 요청
 
-def build_quick_steps_prompt(analysis: dict) -> str:
+def build_quick_steps_prompt(analysis: dict, user_speech: str = "") -> str:
+
+    fixture_type = str(analysis.get("fixture_type", "unknown"))
+    fixture = str(analysis.get("fixture", "") or "")
+    location = str(analysis.get("location", "") or "")
+    danger = str(analysis.get("overall_danger_level", "low") or "")
+    flags = analysis.get("visual_flags") or {}
+    observed = analysis.get("observed_symptoms") or []
+
+    user_ctx = ""
+    if user_speech and user_speech.strip():
+        user_ctx = f"\n- user_speech: {user_speech.strip()}"
+
     return f"""
+
+
 You are FixDad, a careful home repair assistant.
 Given this analysis JSON, produce a safe step-by-step plan.
+
+
+Context you must use:
+- fixture_type: {fixture_type}
+- fixture label: {fixture}
+- location: {location}
+- danger: {danger}
+- visual_flags: {json.dumps(flags, ensure_ascii=False)}
+- observed_symptoms: {json.dumps(observed, ensure_ascii=False)}
+{user_ctx}
 
 Constraints:
 - Keep it short and actionable.
@@ -650,35 +833,49 @@ ANALYSIS_JSON:
 {json.dumps(analysis, ensure_ascii=False, indent=2)}
 """.strip()
 
-async def generate_quick_steps(analysis: dict) -> QuickStepsResponse:
-    prompt = build_quick_steps_prompt(analysis)
+async def generate_quick_steps(analysis: dict, user_speech: str = "") -> QuickStepsResponse:
+    prompt = build_quick_steps_prompt(analysis, user_speech=user_speech)
+
     resp = await asyncio.wait_for(
         asyncio.to_thread(model.generate_content, [prompt]),
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
+
     raw_text = extract_json_object((resp.text or "").strip())
     obj = json.loads(raw_text)
 
     steps = obj.get("steps") or []
     safety = obj.get("safety_notes") or []
     callpro = obj.get("when_to_call_pro") or []
+    next_req = (obj.get("next_photo_request") or "").strip() or None
 
-    if not isinstance(steps, list):
-        steps = [str(steps)]
-    if not isinstance(safety, list):
-        safety = [str(safety)]
-    if not isinstance(callpro, list):
-        callpro = [str(callpro)]
+    # ✅ fixture별 “개인화된” fallback_photo
+    ft = str(analysis.get("fixture_type", "unknown")).lower()
+    loc = str(analysis.get("location", "") or "")
+    fixture = str(analysis.get("fixture", "") or "")
+    if ft == "pipe":
+        fallback_photo = f"Show the leak area and the nearest shutoff valve in one wide shot (location: {loc})."
+    elif ft in ("appliance",) and ("fridge" in fixture.lower() or "refrigerator" in fixture.lower()):
+        fallback_photo = "Show the back/bottom of the fridge and the floor area for any water or frost in one wide shot."
+    else:
+        fallback_photo = f"Take one clear wide photo of the {fixture or ft} and the surrounding area (location: {loc})."
+
+    steps4 = _ensure_four_steps(steps, fallback_photo=fallback_photo)
+
+    # 안전/콜프로도 리스트 형태 보정
+    if not isinstance(safety, list): safety = [str(safety)]
+    if not isinstance(callpro, list): callpro = [str(callpro)]
 
     return QuickStepsResponse(
         fixture_type=str(analysis.get("fixture_type", "unknown")),
-        steps=[str(x) for x in steps][:10],
-        safety_notes=[str(x) for x in safety][:10],
-        when_to_call_pro=[str(x) for x in callpro][:10],
+        steps=steps4,
+        safety_notes=[str(x).strip() for x in safety if str(x).strip()][:6],
+        when_to_call_pro=[str(x).strip() for x in callpro if str(x).strip()][:6],
+        next_photo_request=next_req,
     )
 
 # ============================================================
-# ✅ 4) Toilet “brown tissue => clogged” server 강제 override
+# ✅ 4) Toilet demo: server 강제 override
 # ============================================================
 
 def apply_toilet_demo_overrides(parsed_dict: dict) -> dict:
@@ -744,19 +941,10 @@ def apply_toilet_demo_overrides(parsed_dict: dict) -> dict:
     return parsed_dict
 
 # ============================================================
-# ✅ 4.5) Human detection categorization (three-state system)
+# ✅ 4.5) Human detection categorization
 # ============================================================
 
 def categorize_with_human_detection(parsed_dict: dict) -> dict:
-    """
-    Determines the three-state categorization:
-    - Green (success): no_issue_detected=True
-    - Blue (pending): human_detected=True AND issues exist
-    - Red (error): issues exist, no human detected
-
-    This function runs AFTER apply_toilet_demo_overrides to maintain
-    all existing functionality while adding the human detection layer.
-    """
     try:
         visual_flags = parsed_dict.get("visual_flags") or {}
         human_visible = bool(visual_flags.get("human_visible", False))
@@ -765,13 +953,11 @@ def categorize_with_human_detection(parsed_dict: dict) -> dict:
         issues = parsed_dict.get("prospected_issues") or []
         has_issues = len(issues) > 0 and parsed_dict.get("no_issue_detected", False) is False
 
-        # If issues were already marked as resolved, keep that
         if parsed_dict.get("no_issue_detected", False):
             parsed_dict["human_detected"] = False
             parsed_dict["repair_pending"] = False
             return parsed_dict
 
-        # Issues exist - check for human presence
         if has_issues and (human_visible or human_interacting):
             parsed_dict["human_detected"] = True
             parsed_dict["repair_pending"] = True
@@ -780,7 +966,6 @@ def categorize_with_human_detection(parsed_dict: dict) -> dict:
             parsed_dict["repair_pending"] = False
 
     except Exception:
-        # On error, default to no human detection (maintain existing behavior)
         parsed_dict["human_detected"] = False
         parsed_dict["repair_pending"] = False
 
@@ -791,10 +976,6 @@ def categorize_with_human_detection(parsed_dict: dict) -> dict:
 # ============================================================
 
 def build_rag_query_general(analysis: dict) -> str:
-    """
-    This prevents the system from accidentally using a toilet-biased query.
-    It creates a query that is strongly anchored to the detected fixture + top issue.
-    """
     fixture_type = str(analysis.get("fixture_type", "unknown")).strip().lower()
     fixture = str(analysis.get("fixture", "")).strip().lower()
     location = str(analysis.get("location", "")).strip().lower()
@@ -815,21 +996,25 @@ def build_rag_query_general(analysis: dict) -> str:
     corrosion = bool(flags.get("corrosion_rust_visible", False))
     water_present = bool(analysis.get("water_present", False))
 
-    # Pipe-specific boost terms
     boost_terms = []
     if fixture_type == "pipe" or "pipe" in fixture or "pipe" in top_issue:
-        boost_terms += ["pipe leak", "burst pipe", "water shutoff valve", "leak repair", "temporary patch", "compression fitting"]
+        boost_terms += [
+            "pipe leak",
+            "burst pipe",
+            "water shutoff valve",
+            "leak repair",
+            "temporary patch",
+            "compression fitting",
+        ]
         if leak_visible or water_present:
             boost_terms += ["active leak", "water damage", "contain leak", "bucket towels"]
         if corrosion:
             boost_terms += ["corroded pipe", "pinhole leak", "galvanized pipe"]
 
-    # General fallback
     base = f"{fixture_type} {fixture} {top_issue} {top_cause} {location}".strip()
     sym = " ".join([str(s).strip().lower() for s in symptoms[:8] if str(s).strip()])
 
     query = " | ".join([x for x in [base, sym, " ".join(boost_terms)] if x])
-    # If somehow empty:
     return query if query else "home repair troubleshooting"
 
 # ============================================================
@@ -853,7 +1038,6 @@ def _groq_chat(system: str, user: str) -> str:
 def build_pipe_solution_prompt(analysis: dict, citations: list[dict]) -> Tuple[str, str]:
     system = (
         "You are FixDad, a cautious home repair assistant. "
-        "You MUST tailor the plan to the detected fixture and issue. "
         "If this is a pipe leak/broken pipe, prioritize: shutoff, containment, and safe escalation. "
         "No unsafe instructions (no gas line work, no electrical panel work, no chemical drain cleaners). "
         "If uncertain, ask for 1 specific next photo/check."
@@ -877,6 +1061,30 @@ OUTPUT FORMAT (plain text, exact headings):
 6) Tools / parts checklist (generic, no brand part numbers)
 """.strip()
     return system, user
+def _ensure_four_steps(steps: Any, fallback_photo: str) -> list[str]:
+    if not isinstance(steps, list):
+        steps = [str(steps)] if steps else []
+    steps = [str(s).strip() for s in steps if str(s).strip()]
+
+    # "1) " 이런 prefix 없으면 붙여주기
+    cleaned = []
+    for i, s in enumerate(steps[:4], start=1):
+        if not s.startswith(f"{i})"):
+            # 기존에 "2." "Step 1" 같은거면 그냥 덮어쓰기
+            s = s.lstrip("0123456789).:- ").strip()
+            s = f"{i}) {s}"
+        cleaned.append(s)
+
+    # 부족하면 채우기: 마지막은 escalation/stop 조건으로
+    while len(cleaned) < 4:
+        i = len(cleaned) + 1
+        if i == 1:
+            cleaned.append(f"1) {fallback_photo}")
+        elif i == 4:
+            cleaned.append("4) If the issue persists or worsens, stop and contact maintenance / a professional.")
+        else:
+            cleaned.append(f"{i}) Do the next safe check based on what you see, then re-capture a clear photo.")
+    return cleaned[:4]
 
 def build_generic_solution_prompt(analysis: dict, citations: list[dict]) -> Tuple[str, str]:
     system = (
@@ -905,7 +1113,6 @@ OUTPUT FORMAT:
     return system, user
 
 async def groq_solution_text_for_pipe(analysis: dict) -> Tuple[str, list[dict], str]:
-    # Build a pipe-focused query so RAG doesn't drift to toilet
     query = build_rag_query_general(analysis)
     passages_raw = rag_retrieve(query, top_k=6) if RAG_ENABLED else []
     citations = normalize_passages(passages_raw)
@@ -965,6 +1172,11 @@ async def debug_write(session_id: str = Form("demo-session-1")):
 async def analyze_frame(
     image: UploadFile = File(...),
     session_id: str = Form("demo-session-1"),
+    with_voice: str = Form("false"),
+    voice_id: str = Form(""),
+    # NEW: speech-to-text params from frontend
+    stt_text: str = Form(""),
+    stt_ts: str = Form(""),
 ):
     if not acquire_lock(session_id):
         return {
@@ -989,22 +1201,44 @@ async def analyze_frame(
 
         try:
             pil_image = PIL.Image.open(io.BytesIO(raw_image))
+            # ✅ 안정화: 알파채널/팔레트/포맷 문제 방지
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
         except Exception as e:
-            return {"success": False, "error": f"Bad image: {str(e)}", "session_id": session_id}
+            return {"success": False, "error": f"Bad image: {repr(e)}", "session_id": session_id}
 
-        # (A) First LLM call: image -> JSON (fixture_type 포함)
+        # --- Use speech-to-text if provided, otherwise check notes ---
+        user_context = (stt_text or "").strip()
+
+        if not user_context:
+            try:
+                if USE_REDIS:
+                    key = f"session:{session_id}:notes"
+                    raw = redis_client.lrange(key, -1, -1)
+                    if raw:
+                        note = json.loads(raw[0])
+                        user_context = str(note.get("text", "")).strip()
+                else:
+                    arr = notes_by_session.get(session_id, [])
+                    if arr:
+                        user_context = str(arr[-1].get("text", "")).strip()
+            except Exception:
+                pass
+
+        prompt = build_extraction_prompt(user_context)
+
         try:
+            # ✅ 안정화: 2파트로 단순화 (prompt + image)
             resp = await asyncio.wait_for(
-                asyncio.to_thread(
-                    model.generate_content,
-                    [build_extraction_prompt(), pil_image, "Extract the JSON now. Return only JSON."],
-                ),
+                asyncio.to_thread(model.generate_content, [prompt, pil_image]),
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
             return {"success": False, "error": "Gemini timeout", "session_id": session_id}
         except Exception as e:
-            return {"success": False, "error": f"Gemini API error: {str(e)}", "session_id": session_id}
+            err_full = repr(e)
+            print("🔥 GEMINI ERROR FULL:", err_full)
+            return {"success": False, "error": f"Gemini API error: {err_full}", "session_id": session_id}
 
         raw_text = (resp.text or "").strip()
         json_text = extract_json_object(raw_text)
@@ -1072,8 +1306,24 @@ async def analyze_frame(
                     "steps": [],
                     "safety_notes": [],
                     "when_to_call_pro": [],
-                    "error": f"quick_steps_failed: {str(e)[:120]}",
+                    "error": f"quick_steps_failed: {repr(e)[:140]}",
                 }
+
+        # Optional voice for immediate action
+        want_voice = str(with_voice).lower() in ("1", "true", "yes", "y")
+        voice = None
+        if want_voice:
+            top_issue = ""
+            issues = parsed_dict.get("prospected_issues") or []
+            if isinstance(issues, list) and issues and isinstance(issues[0], dict):
+                top_issue = str(issues[0].get("issue_name", "")).strip()
+            immediate = str(parsed_dict.get("immediate_action", "")).strip()
+            speak_text = f"{top_issue}. {immediate}".strip().strip(".")
+            voice = await asyncio.to_thread(
+                voice_payload_from_text,
+                speak_text[:350],
+                (voice_id.strip() or DEFAULT_VOICE_ID),
+            )
 
         return {
             "success": True,
@@ -1081,6 +1331,7 @@ async def analyze_frame(
             "data": parsed_dict,
             "guide_overlay": guide_overlay,
             "quick_steps": quick_steps,
+            "voice": voice,
         }
 
     finally:
@@ -1115,6 +1366,13 @@ async def health_check():
         "groq_enabled": bool(groq_client),
         "llama_pipeline_enabled": LLAMA_ENABLED,
         "rag_enabled": RAG_ENABLED,
+        "elevenlabs_enabled": bool(_eleven_client()),
+        "default_voice_id": DEFAULT_VOICE_ID,
+        "eleven_voice_env": os.environ.get("ELEVENLABS_VOICE_ID"),
+        "eleven_api_key_present": bool(ELEVENLABS_API_KEY),
+        "eleven_sdk_present": ELEVENLABS_AVAILABLE,
+        "default_tts_model_id": DEFAULT_TTS_MODEL_ID,
+        "gemini_model": GEMINI_MODEL,
     }
 
 # ============================================================
@@ -1133,6 +1391,11 @@ async def guide_init(req: GuideInitRequest):
         return {"success": False, "error": "No analysis found. Capture a frame first.", "session_id": session_id}
 
     analysis = latest_item.get("data") if isinstance(latest_item, dict) else None
+    # NOTE: If your editor auto-changed quotes, fix it back to: latest_item.get("data")
+    # Keeping an explicit safe fallback below:
+    if analysis is None and isinstance(latest_item, dict):
+        analysis = latest_item.get("data")
+
     if not analysis or not isinstance(analysis, dict):
         return {"success": False, "error": "Latest analysis missing data", "session_id": session_id}
 
@@ -1296,7 +1559,7 @@ async def guide_next(req: GuideNextRequest):
 
         if st.failed_attempts[k] >= 2 and st.current_step < max_step:
             st.current_step = min(st.current_step + 1, max_step)
-            msg = "Tried enough. Let’s escalate to the next step."
+            msg = "Tried enough. Let's escalate to the next step."
         else:
             msg = "Got it. Try the same step once more carefully."
 
@@ -1346,10 +1609,13 @@ async def guide_next(req: GuideNextRequest):
 
 # ============================================================
 # ✅ Solution endpoint: ROUTE BY fixture_type
+# + optional voice output via with_voice=true
 # ============================================================
 
 class SolutionRequest(BaseModel):
     session_id: str = "demo-session-1"
+    with_voice: bool = False
+    voice_id: Optional[str] = None
 
 @app.post("/solution")
 async def generate_solution(req: SolutionRequest):
@@ -1367,9 +1633,18 @@ async def generate_solution(req: SolutionRequest):
 
     fixture_type = str(analysis.get("fixture_type", "unknown")).lower()
 
-    # ------------------------------------------------------------
-    # (A) TOILET: keep your existing Llama pipeline (demo)
-    # ------------------------------------------------------------
+    async def _attach_voice(resp_dict: dict, spoken_text: str):
+        if not req.with_voice:
+            return resp_dict
+        voice = await asyncio.to_thread(
+            voice_payload_from_text,
+            spoken_text[:450],
+            (req.voice_id or DEFAULT_VOICE_ID),
+        )
+        resp_dict["voice"] = voice
+        return resp_dict
+
+    # (A) TOILET: Llama pipeline
     if fixture_type == "toilet" and LLAMA_ENABLED:
         t0 = time.time()
         success, reasoner_output, error = refine_observation_and_build_query(analysis, session_id)
@@ -1387,7 +1662,7 @@ async def generate_solution(req: SolutionRequest):
         retrieved_docs = []
         retrieval_metrics = None
 
-        if reasoner_output.requires_rag:
+        if getattr(reasoner_output, "requires_rag", False):
             t0 = time.time()
             try:
                 passages_raw = rag_retrieve(reasoner_output.rag_query, top_k=6) if RAG_ENABLED else []
@@ -1438,24 +1713,24 @@ async def generate_solution(req: SolutionRequest):
             }
             redis_client.set(k_solution_latest(session_id), json.dumps(solution_data), ex=REDIS_TTL_SECONDS)
 
-        return {
+        out = {
             "success": True,
             "session_id": session_id,
             "reasoner_output": reasoner_output.model_dump(),
             "fix_plan": fix_plan.model_dump(),
-            "query": reasoner_output.rag_query,
+            "query": getattr(reasoner_output, "rag_query", ""),
             "citations": retrieved_docs,
-            "solution": fix_plan.summary,
+            "solution": getattr(fix_plan, "summary", ""),
             "stage_latencies": stage_latencies,
             "total_latency_ms": total_latency_ms,
             "routed_mode": "toilet_llama_pipeline",
         }
 
-    # ------------------------------------------------------------
-    # (B) PIPE: force a pipe-specific Groq plan (fixes your issue)
-    # ------------------------------------------------------------
+        spoken = f"Here's what we'll do. {getattr(fix_plan, 'summary', '')}".strip()
+        return await _attach_voice(out, spoken)
+
+    # (B) PIPE: Groq pipe plan if possible
     if fixture_type == "pipe":
-        # Prefer Groq for pipe; if not available, fallback to Gemini legacy
         if groq_client:
             try:
                 t0 = time.time()
@@ -1480,7 +1755,7 @@ async def generate_solution(req: SolutionRequest):
                         ex=REDIS_TTL_SECONDS,
                     )
 
-                return {
+                out = {
                     "success": True,
                     "session_id": session_id,
                     "query": query,
@@ -1490,16 +1765,23 @@ async def generate_solution(req: SolutionRequest):
                     "total_latency_ms": total_latency_ms,
                     "routed_mode": "pipe_groq",
                 }
+
+                spoken = (
+                    "I think this is a pipe leak. First, shut off the water if you can, then contain the leak. "
+                    "I'll walk you through the safe steps now."
+                )
+                return await _attach_voice(out, spoken)
+
             except Exception as e:
-                # fall through to legacy below
-                stage_latencies["groq_error"] = str(e)[:140]
+                stage_latencies["groq_error"] = repr(e)[:180]
 
-        # Gemini fallback (pipe-specific query!)
-        return await _legacy_gemini_solution(req, analysis, session_id, forced_query=build_rag_query_general(analysis), routed_mode="pipe_gemini_fallback")
+        return await _legacy_gemini_solution(
+            req, analysis, session_id,
+            forced_query=build_rag_query_general(analysis),
+            routed_mode="pipe_gemini_fallback"
+        )
 
-    # ------------------------------------------------------------
-    # (C) OTHER fixture types: Groq generic if possible, else Gemini legacy
-    # ------------------------------------------------------------
+    # (C) OTHER: Groq generic if possible
     if groq_client:
         try:
             t0 = time.time()
@@ -1524,7 +1806,7 @@ async def generate_solution(req: SolutionRequest):
                     ex=REDIS_TTL_SECONDS,
                 )
 
-            return {
+            out = {
                 "success": True,
                 "session_id": session_id,
                 "query": query,
@@ -1534,17 +1816,32 @@ async def generate_solution(req: SolutionRequest):
                 "total_latency_ms": total_latency_ms,
                 "routed_mode": "generic_groq",
             }
-        except Exception as e:
-            stage_latencies["groq_error"] = str(e)[:140]
+            spoken = "Okay. I'll explain what I think is happening and the safest next steps."
+            return await _attach_voice(out, spoken)
 
-    return await _legacy_gemini_solution(req, analysis, session_id, forced_query=build_rag_query_general(analysis), routed_mode="generic_gemini")
+        except Exception as e:
+            stage_latencies["groq_error"] = repr(e)[:180]
+
+    out = await _legacy_gemini_solution(
+        req, analysis, session_id,
+        forced_query=build_rag_query_general(analysis),
+        routed_mode="generic_gemini"
+    )
+    if out.get("success") and req.with_voice:
+        out = await _attach_voice(out, "Here are the safest next steps based on what I see.")
+    return out
 
 # ============================================================
 # Legacy Gemini-only solution (fallback)
-# (Now supports forced_query so pipe doesn't drift to toilet.)
 # ============================================================
 
-async def _legacy_gemini_solution(req: SolutionRequest, analysis: dict, session_id: str, forced_query: Optional[str] = None, routed_mode: str = "legacy_gemini"):
+async def _legacy_gemini_solution(
+    req: SolutionRequest,
+    analysis: dict,
+    session_id: str,
+    forced_query: Optional[str] = None,
+    routed_mode: str = "legacy_gemini",
+):
     try:
         query = forced_query or analysis_to_query(analysis)
     except Exception:
@@ -1590,7 +1887,7 @@ Rules:
     except asyncio.TimeoutError:
         return {"success": False, "error": "Gemini timeout (solution)", "session_id": session_id}
     except Exception as e:
-        return {"success": False, "error": f"Gemini API error (solution): {str(e)}", "session_id": session_id}
+        return {"success": False, "error": f"Gemini API error (solution): {repr(e)}", "session_id": session_id}
 
     solution_text = (resp.text or "").strip()
 
@@ -1611,64 +1908,29 @@ Rules:
 # ============================================================
 
 class TTSRequest(BaseModel):
+    # 프론트에서 같이 보내는 session_id가 있어도 validation 실패 안 나게 받음
+    session_id: Optional[str] = None
+
     text: str = Field(min_length=1, max_length=1000)
-    voice_id: Optional[str] = "iP95p4xoKVk53GoZ742B"  # Your custom voice
+    voice_id: Optional[str] = None
+
+    # Pydantic v2: extra 필드가 와도 무시
+    model_config = {"extra": "ignore"}
+
 
 @app.post("/tts")
 async def text_to_speech(request: TTSRequest):
-    """
-    Convert text to speech using ElevenLabs API.
-    Returns audio bytes that can be played in the browser.
-    """
     if not ELEVENLABS_AVAILABLE:
-        return {
-            "success": False,
-            "error": "ElevenLabs SDK not installed. Run: pip install elevenlabs"
-        }
-
+        return {"success": False, "error": "ElevenLabs SDK not installed. Run: pip install elevenlabs"}
     if not ELEVENLABS_API_KEY:
-        return {
-            "success": False,
-            "error": "ELEVENLABS_API_KEY not set in .env file"
-        }
+        return {"success": False, "error": "ELEVENLABS_API_KEY not set in .env file"}
 
     try:
-        client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
-        # Generate speech with dad-like voice settings
-        audio_generator = client.text_to_speech.convert(
-            text=request.text,
-            voice_id=request.voice_id,
-            model_id="eleven_turbo_v2_5",  # Fast, high-quality model
-            voice_settings=VoiceSettings(
-                stability=0.5,  # More expressive
-                similarity_boost=0.75,  # Clear pronunciation
-                style=0.3,  # Slightly more conversational
-                use_speaker_boost=True
-            )
-        )
-
-        # Collect audio chunks
-        audio_bytes = b""
-        for chunk in audio_generator:
-            if chunk:
-                audio_bytes += chunk
-
-        # Return audio as response
-        from fastapi.responses import Response
-        return Response(
-            content=audio_bytes,
-            media_type="audio/mpeg",
-            headers={
-                "Content-Disposition": "inline; filename=speech.mp3"
-            }
-        )
-
+        audio_bytes = await asyncio.to_thread(tts_bytes, request.text, request.voice_id or DEFAULT_VOICE_ID)
+        audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+        return {"success": True, "audio_base64": audio_base64, "mime": "audio/mpeg"}
     except Exception as e:
-        return {
-            "success": False,
-            "error": f"TTS generation failed: {str(e)}"
-        }
+        return {"success": False, "error": f"TTS generation failed: {repr(e)}"}
 
 if __name__ == "__main__":
     import uvicorn

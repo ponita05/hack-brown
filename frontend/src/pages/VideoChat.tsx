@@ -3,12 +3,15 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Header } from '@/components/landing/Header';
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible';
+import {
   Video,
   VideoOff,
   Camera,
   Loader2,
-  Maximize2,
-  Minimize2,
   Play,
   Pause,
   BookOpen,
@@ -16,6 +19,8 @@ import {
   RotateCcw,
   AlertTriangle,
   ListChecks,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -166,6 +171,9 @@ const CLIENT_MIN_GAP_MS = 3800;
 const MANUAL_WAIT_POLL_MS = 120;
 const TOAST_COOLDOWN_MS = 1500;
 
+// Voice throttling (avoid talking every frame)
+const VOICE_MIN_GAP_MS = 3200;
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export default function VideoChat() {
@@ -180,7 +188,7 @@ export default function VideoChat() {
 
   // backend /frame
   const [manualCaptureLoading, setManualCaptureLoading] = useState(false);
-  const [autoCapture, setAutoCapture] = useState(false);
+  const [autoCapture, setAutoCapture] = useState(true);
   const [latestAnalysis, setLatestAnalysis] =
     useState<HomeIssueAnalysis | null>(null);
 
@@ -200,11 +208,36 @@ export default function VideoChat() {
   // backend overlay
   const [guideOverlay, setGuideOverlay] = useState<GuideOverlay>(null);
 
+  // ✅ Voice toggle
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+
+  // ✅ Speech-to-Text (user input)
+  const [userSpeechTranscript, setUserSpeechTranscript] = useState<string>('');
+  const [isListening, setIsListening] = useState(false);
+  const [isTranscriptOpen, setIsTranscriptOpen] = useState(false);
+
+  // ✅ IMPORTANT: transcript ref (for stable auto-capture loop)
+  const userSpeechTranscriptRef = useRef<string>('');
+  useEffect(() => {
+    userSpeechTranscriptRef.current = userSpeechTranscript;
+  }, [userSpeechTranscript]);
+
   // refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  type RecentStt = { text: string; ts: number } | null;
+  const latestSttRef = useRef<RecentStt>(null);
+
+  // 프레임에 붙일 STT 유효기간 (윈도우)
+  const STT_ATTACH_WINDOW_MS = 8000;
+
+  // audio/speech refs
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const speechUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const shouldListenRef = useRef(false);
+  const isRecognitionActiveRef = useRef(false);
 
   // loop refs
   const inFlightRef = useRef(false);
@@ -214,6 +247,134 @@ export default function VideoChat() {
   const abortRef = useRef<AbortController | null>(null);
   const lastClientSendAtRef = useRef(0);
   const prevHadIssueRef = useRef<boolean | null>(null);
+
+  // analysis refs
+  const latestAnalysisRef = useRef<HomeIssueAnalysis | null>(null);
+
+  // voice throttling refs
+  const lastVoiceAtRef = useRef(0);
+  const lastVoiceKeyRef = useRef<string>('');
+
+  const stopAllAudio = useCallback(() => {
+    try {
+      if (audioRef.current) {
+        audioRef.current.onended = null;
+        audioRef.current.onerror = null;
+        audioRef.current.pause();
+        audioRef.current.src = '';
+        audioRef.current = null;
+      }
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+      speechUtteranceRef.current = null;
+    } finally {
+      setIsDadSpeaking(false);
+    }
+  }, []);
+
+  // ✅ Speech Recognition
+  const startSpeechRecognition = useCallback(() => {
+    if (typeof window === 'undefined') return;
+
+    if (isRecognitionActiveRef.current || recognitionRef.current) return;
+
+    const SpeechRecognition =
+      (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      toast.error('Speech recognition not supported in this browser');
+      return;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onstart = () => {
+        isRecognitionActiveRef.current = true;
+        setIsListening(true);
+      };
+
+      recognition.onresult = (event: any) => {
+        let finalTranscript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript + ' ';
+          }
+        }
+        if (finalTranscript) {
+          setUserSpeechTranscript((prev) => {
+            const combined = (prev + ' ' + finalTranscript).trim();
+            return combined.slice(-500);
+          });
+
+          // ✅ 추가
+          latestSttRef.current = {
+            text: finalTranscript.trim(),
+            ts: Date.now(),
+          };
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        isRecognitionActiveRef.current = false;
+        if (
+          event.error === 'not-allowed' ||
+          event.error === 'service-not-allowed'
+        ) {
+          toast.error(
+            'Microphone permission denied. Enable it in browser settings.',
+          );
+          setIsListening(false);
+        }
+      };
+
+      recognition.onend = () => {
+        isRecognitionActiveRef.current = false;
+
+        if (shouldListenRef.current) {
+          setTimeout(() => {
+            if (shouldListenRef.current && !isRecognitionActiveRef.current) {
+              try {
+                recognition.start();
+              } catch {
+                setIsListening(false);
+              }
+            }
+          }, 120);
+        } else {
+          setIsListening(false);
+          recognitionRef.current = null;
+        }
+      };
+
+      shouldListenRef.current = true;
+      recognition.start();
+      recognitionRef.current = recognition;
+    } catch {
+      isRecognitionActiveRef.current = false;
+      toast.error('Failed to start speech recognition');
+    }
+  }, []);
+
+  const stopSpeechRecognition = useCallback(() => {
+    shouldListenRef.current = false;
+    isRecognitionActiveRef.current = false;
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+      recognitionRef.current = null;
+    }
+    setIsListening(false);
+    setUserSpeechTranscript('');
+    userSpeechTranscriptRef.current = '';
+    latestSttRef.current = null;
+  }, []);
 
   const startVideo = useCallback(async () => {
     try {
@@ -229,22 +390,26 @@ export default function VideoChat() {
 
       videoRef.current.srcObject = stream;
       streamRef.current = stream;
-
       await videoRef.current.play();
 
       setHasFirstAnalysis(false);
       setLatestAnalysis(null);
+      latestAnalysisRef.current = null;
       setGuideOverlay(null);
 
-      setIsDadSpeaking(false);
+      stopAllAudio();
 
+      setAutoCapture(true);
       setIsVideoActive(true);
+
+      startSpeechRecognition();
+
       toast.success('Camera started! Point at your issue.');
     } catch (error) {
       console.error('❌ startVideo error:', error);
       toast.error('Could not access camera. Please check permissions.');
     }
-  }, []);
+  }, [stopAllAudio, startSpeechRecognition]);
 
   const stopVideo = useCallback(() => {
     stopLoopRef.current = true;
@@ -253,25 +418,23 @@ export default function VideoChat() {
     abortRef.current?.abort();
     abortRef.current = null;
 
+    stopAllAudio();
+    stopSpeechRecognition();
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
+    if (videoRef.current) videoRef.current.srcObject = null;
 
     setAutoCapture(false);
     setIsVideoActive(false);
 
     setGuideOverlay(null);
     setLatestAnalysis(null);
+    latestAnalysisRef.current = null;
     setHasFirstAnalysis(false);
 
-    // Dad indicator reset
-    setIsDadSpeaking(false);
-
-    // guided + rag reset
     setGuidePlanId(null);
     setGuideSteps([]);
     setGuideState(null);
@@ -281,7 +444,7 @@ export default function VideoChat() {
     setRagQuery('');
 
     prevHadIssueRef.current = null;
-  }, []);
+  }, [stopAllAudio, stopSpeechRecognition]);
 
   const captureFrame = useCallback((): string | null => {
     if (!videoRef.current || !canvasRef.current) return null;
@@ -297,16 +460,90 @@ export default function VideoChat() {
     canvas.height = video.videoHeight;
 
     ctx.drawImage(video, 0, 0);
-
     return canvas.toDataURL('image/jpeg', 0.8);
   }, []);
 
+  const playAudioBase64 = useCallback(
+    async (audioBase64: string, mime: string = 'audio/mpeg') => {
+      stopAllAudio();
+      try {
+        setIsDadSpeaking(true);
+        const binary = atob(audioBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        const blob = new Blob([bytes], { type: mime });
+        const url = URL.createObjectURL(blob);
+
+        const audio = new Audio(url);
+        audioRef.current = audio;
+
+        audio.onplaying = () => setIsDadSpeaking(true);
+        audio.onended = () => {
+          setIsDadSpeaking(false);
+          URL.revokeObjectURL(url);
+        };
+        audio.onerror = () => {
+          setIsDadSpeaking(false);
+          URL.revokeObjectURL(url);
+        };
+
+        await audio.play();
+      } catch (e) {
+        console.error('base64 audio playback error:', e);
+        setIsDadSpeaking(false);
+      }
+    },
+    [stopAllAudio],
+  );
+
+  const playVoiceMessage = useCallback(
+    async (text: string) => {
+      if (!voiceEnabled) return;
+      if (!text?.trim()) return;
+
+      const now = Date.now();
+      if (now - lastVoiceAtRef.current < VOICE_MIN_GAP_MS) return;
+      lastVoiceAtRef.current = now;
+
+      try {
+        const res = await fetch(`${BACKEND_URL}/tts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: SESSION_ID, text }),
+        });
+
+        const data = await res.json().catch(() => null);
+
+        if (res.ok && data?.success && data?.audio_base64) {
+          await playAudioBase64(data.audio_base64, data.mime || 'audio/mpeg');
+          return;
+        }
+
+        const now2 = Date.now();
+        if (now2 - lastToastAtRef.current > 2500) {
+          toast.error('TTS backend failed (no ElevenLabs audio).');
+          lastToastAtRef.current = now2;
+        }
+      } catch (e) {
+        console.error('❌ /tts network error:', e);
+        const now2 = Date.now();
+        if (now2 - lastToastAtRef.current > 2500) {
+          toast.error('Cannot reach /tts backend.');
+          lastToastAtRef.current = now2;
+        }
+      }
+    },
+    [voiceEnabled, playAudioBase64],
+  );
+
+  // ✅ 핵심: sendFrameToBackend가 transcript state에 의존하지 않음 (ref로 읽음)
   const sendFrameToBackend = useCallback(
     async (showToast: boolean = true): Promise<SendResult> => {
       if (inFlightRef.current) return { ok: false, reason: 'busy' };
 
       const nowMs = Date.now();
-      if (nowMs - lastClientSendAtRef.current < CLIENT_MIN_GAP_MS) {
+      const timeSinceLastSend = nowMs - lastClientSendAtRef.current;
+      if (timeSinceLastSend < CLIENT_MIN_GAP_MS) {
         return { ok: false, reason: 'throttled' };
       }
 
@@ -330,6 +567,29 @@ export default function VideoChat() {
         formData.append('image', blob, 'frame.jpg');
         formData.append('session_id', SESSION_ID);
 
+        // ✅ ref에서 읽기 (루프 안정화)
+        // ✅ Method A: 최근 STT 덩어리(최신 final)만 프레임에 함께 전송
+        const stt = latestSttRef.current;
+        const withinWindow =
+          !!stt && Date.now() - stt.ts <= STT_ATTACH_WINDOW_MS;
+
+        if (withinWindow && stt?.text) {
+          // 백엔드에서 받을 필드명: stt_text / stt_ts
+          formData.append('stt_text', stt.text);
+          formData.append('stt_ts', String(stt.ts));
+
+          // ✅ 소모(중복 방지): 한 번 프레임에 실어 보내면 비움
+          latestSttRef.current = null;
+
+          // (선택) UI에 누적 transcript도 같이 비우고 싶으면 아래 줄 켜기
+          // setUserSpeechTranscript('');
+          // userSpeechTranscriptRef.current = '';
+        } else {
+          // 텍스트 없으면 안 보내도 되지만, 백엔드 파싱 단순하게 하려면 빈 값으로 보내도 됨
+          // formData.append('stt_text', '');
+          // formData.append('stt_ts', '');
+        }
+
         abortRef.current?.abort();
         const controller = new AbortController();
         abortRef.current = controller;
@@ -350,8 +610,12 @@ export default function VideoChat() {
 
         const result = await res.json().catch(() => null);
 
-        if (result?.success && result?.data) {
-          const analysis: HomeIssueAnalysis = result.data;
+        // ✅ robust parse: data / analysis 둘 다 허용
+        const analysis: HomeIssueAnalysis | null =
+          result?.data ?? result?.analysis ?? null;
+
+        if (result?.success && analysis) {
+          latestAnalysisRef.current = analysis;
           setLatestAnalysis(analysis);
           setHasFirstAnalysis(true);
 
@@ -369,15 +633,21 @@ export default function VideoChat() {
           if (showToast) {
             const now = Date.now();
             if (now - lastToastAtRef.current > TOAST_COOLDOWN_MS) {
-              if (prevHadIssue === true && isNoIssue) {
+              if (prevHadIssue === true && isNoIssue)
                 toast.success('✅ Resolved — looks fixed.');
-              } else if (isNoIssue) {
+              else if (isNoIssue)
                 toast.success('✅ Looks good — no issue detected.');
-              } else {
-                toast.success(`🔎 Issue detected: ${topIssue}`);
-              }
+              else toast.success(`🔎 Issue detected: ${topIssue}`);
               lastToastAtRef.current = now;
             }
+          }
+
+          // optional voice payload
+          if (voiceEnabled && result?.voice?.audio_base64) {
+            playAudioBase64(
+              result.voice.audio_base64,
+              result.voice.mime || 'audio/mpeg',
+            );
           }
 
           return { ok: true, reason: 'ok', ms };
@@ -396,17 +666,15 @@ export default function VideoChat() {
         return { ok: false, reason: 'failed', ms };
       } catch (error: any) {
         const ms = performance.now() - t0;
-
-        if (error?.name === 'AbortError') {
+        if (error?.name === 'AbortError')
           return { ok: false, reason: 'skipped', ms };
-        }
         console.error('[frame] ✗ network', error);
         return { ok: false, reason: 'network', ms };
       } finally {
         inFlightRef.current = false;
       }
     },
-    [captureFrame],
+    [captureFrame, voiceEnabled, playAudioBase64],
   );
 
   useEffect(() => {
@@ -426,7 +694,6 @@ export default function VideoChat() {
         const r = await sendFrameToBackend(true);
 
         let waitMs = AUTO_CAPTURE_INTERVAL_MS;
-
         if (!r.ok) {
           if (r.reason === 'busy') waitMs = 300;
           else if (r.reason === 'duplicate') waitMs = 700;
@@ -438,9 +705,7 @@ export default function VideoChat() {
               toast.error('Cannot connect to backend.');
               lastToastAtRef.current = now;
             }
-          } else {
-            waitMs = 500;
-          }
+          } else waitMs = 500;
         }
 
         await sleep(waitMs);
@@ -463,21 +728,15 @@ export default function VideoChat() {
     setCitations([]);
     setRagQuery('');
 
-    while (inFlightRef.current) {
-      await sleep(MANUAL_WAIT_POLL_MS);
-    }
+    while (inFlightRef.current) await sleep(MANUAL_WAIT_POLL_MS);
 
     const r = await sendFrameToBackend(false);
 
     if (r.ok) {
-      const a = latestAnalysis;
-      await sleep(10);
-      const a2 = latestAnalysis ?? a;
-
+      const a2 = latestAnalysisRef.current;
       const isNoIssue = a2?.no_issue_detected === true;
       const topIssue =
         a2?.prospected_issues?.[0]?.issue_name || 'Issue detected';
-
       if (isNoIssue) toast.success('✅ Looks good — no issue detected.');
       else toast.success(`🔎 Issue detected: ${topIssue}`);
     } else {
@@ -524,9 +783,6 @@ export default function VideoChat() {
     }
   };
 
-  // ==========================================================
-  // ✅ Guided Fix
-  // ==========================================================
   const startGuidedFix = async () => {
     if (latestAnalysis?.no_issue_detected === true) {
       toast.error('No issue detected in the latest frame.');
@@ -704,100 +960,33 @@ export default function VideoChat() {
     return guideSteps[idx] || null;
   };
 
-  // Text-to-Speech function
-  const playVoiceMessage = async (text: string) => {
-    try {
-      // turn ON speaking indicator immediately (FaceTime feel)
-      setIsDadSpeaking(true);
-
-      const response = await fetch(`${BACKEND_URL}/tts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      });
-
-      if (!response.ok) {
-        console.error('TTS failed:', response.statusText);
-        setIsDadSpeaking(false);
-        return;
-      }
-
-      const audioBlob = await response.blob();
-      const audioUrl = URL.createObjectURL(audioBlob);
-
-      // Stop previous audio if playing
-      if (audioRef.current) {
-        audioRef.current.onended = null;
-        audioRef.current.pause();
-        audioRef.current = null;
-      }
-
-      // Create and play new audio
-      const audio = new Audio(audioUrl);
-      audioRef.current = audio;
-
-      // keep indicator ON while audio plays
-      audio.onplaying = () => setIsDadSpeaking(true);
-      audio.onended = () => {
-        setIsDadSpeaking(false);
-        URL.revokeObjectURL(audioUrl);
-      };
-      audio.onerror = () => {
-        setIsDadSpeaking(false);
-        URL.revokeObjectURL(audioUrl);
-      };
-
-      await audio.play();
-    } catch (error) {
-      console.error('Voice playback error:', error);
-      setIsDadSpeaking(false);
-    }
-  };
-
-  // Safety: if component unmounts, stop audio + speaking indicator
   useEffect(() => {
     return () => {
-      try {
-        if (audioRef.current) {
-          audioRef.current.pause();
-          audioRef.current = null;
-        }
-      } finally {
-        setIsDadSpeaking(false);
-      }
+      stopAllAudio();
     };
-  }, []);
+  }, [stopAllAudio]);
 
   const curStep = getCurrentGuideStep();
 
-  // Three-state categorization logic
   const analysisState = (() => {
     if (!latestAnalysis) return null;
-
-    if (latestAnalysis.no_issue_detected === true) {
-      return 'success'; // Green
-    }
-
+    if (latestAnalysis.no_issue_detected === true) return 'success';
     if (
       latestAnalysis.human_detected === true &&
       latestAnalysis.repair_pending === true
-    ) {
-      return 'pending'; // Blue - NEW STATE
-    }
-
-    return 'error'; // Red
+    )
+      return 'pending';
+    return 'error';
   })();
 
   const isLatestNoIssue = analysisState === 'success';
   const isRepairPending = analysisState === 'pending';
-  const hasErrors = analysisState === 'error';
 
-  // Voice feedback effect - plays audio when state changes
   useEffect(() => {
     if (!latestAnalysis || !hasFirstAnalysis) return;
+    if (!voiceEnabled) return;
 
     let message = '';
-
     if (analysisState === 'success') {
       message = 'All clear! No issues detected. Everything looks good.';
     } else if (analysisState === 'pending') {
@@ -808,7 +997,6 @@ export default function VideoChat() {
       const topIssue =
         latestAnalysis.prospected_issues?.[0]?.issue_name || 'an issue';
       const dangerLevel = latestAnalysis.overall_danger_level;
-
       if (dangerLevel === 'high') {
         message = `Attention! I detected ${topIssue}. This requires immediate action. ${latestAnalysis.immediate_action}`;
       } else if (dangerLevel === 'medium') {
@@ -818,16 +1006,19 @@ export default function VideoChat() {
       }
     }
 
-    if (message) {
-      playVoiceMessage(message);
-    }
+    const key = `${analysisState}|${latestAnalysis.prospected_issues?.[0]?.issue_name ?? ''}|${latestAnalysis.overall_danger_level}|${latestAnalysis.immediate_action ?? ''}`;
+    if (key === lastVoiceKeyRef.current) return;
+    lastVoiceKeyRef.current = key;
+
+    if (message) playVoiceMessage(message);
   }, [
     analysisState,
-    latestAnalysis?.prospected_issues?.[0]?.issue_name,
+    latestAnalysis,
     hasFirstAnalysis,
+    voiceEnabled,
+    playVoiceMessage,
   ]);
 
-  // ✅ overlay: prefer backend overlay, else computed
   const computedOverlay: GuideOverlay = (() => {
     if (guideOverlay?.active) return guideOverlay;
 
@@ -851,37 +1042,6 @@ export default function VideoChat() {
       };
     }
 
-    if (isVideoActive && latestAnalysis && !isLatestNoIssue) {
-      const top = latestAnalysis.prospected_issues?.[0];
-      const level: 'medium' | 'high' =
-        latestAnalysis.overall_danger_level === 'high' ? 'high' : 'medium';
-
-      return {
-        active: true,
-        type: 'step',
-        level,
-        title: 'Guided Fix Ready',
-        message: top
-          ? `Likely issue: ${top.issue_name}\nScroll down for details and start step-by-step.`
-          : `Scroll down for details and start step-by-step.`,
-        safety_note: latestAnalysis.requires_shutoff
-          ? 'Turn off water if leaking/overflow risk.'
-          : null,
-        check_hint: 'Keep camera steady + good lighting.',
-        plan_id: guidePlanId || 'pre-guide',
-        focus: {
-          fixture: latestAnalysis.fixture,
-          location: latestAnalysis.location,
-          category: top?.category,
-          issue_name: top?.issue_name,
-        },
-        status: 'active',
-        current_step: 1,
-        total_steps: guideSteps.length || 0,
-      };
-    }
-
-    // NEW: Repair pending state (human detected with issues)
     if (isVideoActive && latestAnalysis && isRepairPending) {
       const top = latestAnalysis.prospected_issues?.[0];
       return {
@@ -905,6 +1065,35 @@ export default function VideoChat() {
         },
         status: 'active',
         current_step: 0,
+        total_steps: guideSteps.length || 0,
+      };
+    }
+
+    if (isVideoActive && latestAnalysis && !isLatestNoIssue) {
+      const top = latestAnalysis.prospected_issues?.[0];
+      const level: 'medium' | 'high' =
+        latestAnalysis.overall_danger_level === 'high' ? 'high' : 'medium';
+      return {
+        active: true,
+        type: 'step',
+        level,
+        title: 'Guided Fix Ready',
+        message: top
+          ? `Likely issue: ${top.issue_name}\nScroll down for details and start step-by-step.`
+          : `Scroll down for details and start step-by-step.`,
+        safety_note: latestAnalysis.requires_shutoff
+          ? 'Turn off water if leaking/overflow risk.'
+          : null,
+        check_hint: 'Keep camera steady + good lighting.',
+        plan_id: guidePlanId || 'pre-guide',
+        focus: {
+          fixture: latestAnalysis.fixture,
+          location: latestAnalysis.location,
+          category: top?.category,
+          issue_name: top?.issue_name,
+        },
+        status: 'active',
+        current_step: 1,
         total_steps: guideSteps.length || 0,
       };
     }
@@ -934,7 +1123,6 @@ export default function VideoChat() {
   })();
 
   const overlayToShow = computedOverlay;
-
   const overlayIsSolved =
     overlayToShow?.type === 'done' ||
     (hasFirstAnalysis && latestAnalysis?.no_issue_detected === true);
@@ -961,9 +1149,6 @@ export default function VideoChat() {
         ? 'text-rose-50'
         : 'text-orange-50';
 
-  // =======================================================================
-  // UI helpers for lower panel
-  // =======================================================================
   const dangerBadge = (() => {
     if (!latestAnalysis) return null;
 
@@ -1003,7 +1188,6 @@ export default function VideoChat() {
     <div className="min-h-screen bg-background">
       <Header />
 
-      {/* ===== HERO VIDEO AREA (main) ===== */}
       <main className="pt-20">
         <div className="px-3 sm:px-4">
           <div className="max-w-7xl mx-auto">
@@ -1018,12 +1202,9 @@ export default function VideoChat() {
                 autoPlay
                 playsInline
                 muted
-                className={`w-full h-full object-cover ${
-                  isVideoActive ? '' : 'hidden'
-                }`}
+                className={`w-full h-full object-cover ${isVideoActive ? '' : 'hidden'}`}
               />
 
-              {/* Overlay */}
               {isVideoActive && overlayToShow?.active && (
                 <div className="absolute top-4 right-4 w-[380px] max-w-[92%] z-30">
                   <div
@@ -1112,9 +1293,7 @@ export default function VideoChat() {
                 </div>
               )}
 
-              {/* Top-left: FaceTime-style call chrome + Fullscreen */}
               <div className="absolute top-4 left-4 z-30 flex items-center gap-3">
-                {/* Dad PiP bubble */}
                 {isVideoActive && (
                   <div className="flex items-center gap-3">
                     <div
@@ -1131,14 +1310,11 @@ export default function VideoChat() {
                         className="w-full h-full object-cover"
                         draggable={false}
                       />
-
-                      {/* Speaking pulse */}
                       {isDadSpeaking && (
                         <div className="absolute inset-0 animate-pulse bg-orange-400/15" />
                       )}
                     </div>
 
-                    {/* Call status pill */}
                     <div className="px-3 py-1.5 rounded-full bg-gradient-to-r from-orange-600 to-orange-500 border border-orange-400/30 backdrop-blur text-white text-xs font-bold tracking-wide shadow-lg shadow-orange-500/30">
                       HandyDaddy • Connected
                       {isDadSpeaking ? ' • Speaking…' : ''}
@@ -1147,18 +1323,14 @@ export default function VideoChat() {
                 )}
               </div>
 
-              {/* Bottom controls */}
+
               {isVideoActive ? (
                 <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 flex flex-wrap items-center justify-center gap-3">
                   <Button
                     variant={autoCapture ? 'default' : 'hero'}
                     size="lg"
                     onClick={() => setAutoCapture((v) => !v)}
-                    className={
-                      autoCapture
-                        ? 'bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-700 hover:to-orange-600 shadow-lg shadow-orange-500/30'
-                        : 'bg-gradient-to-r from-orange-600 to-orange-500 hover:from-orange-700 hover:to-orange-600 shadow-lg shadow-orange-500/30'
-                    }
+                    className="bg-gradient-to-r from-emerald-600 to-green-500 hover:from-emerald-700 hover:to-green-600 shadow-lg shadow-emerald-500/30"
                   >
                     {autoCapture ? (
                       <>
@@ -1221,6 +1393,10 @@ export default function VideoChat() {
             </div>
           </div>
 
+          {/* 아래 대시보드(Analysis/RAG/Guide)는 너가 준 기존 그대로 유지 가능 */}
+          {/* 여기서는 길이 때문에 생략 안 하고, 네 코드 그대로 붙여도 됨 */}
+          {/* ✅ 중요 변경은 "auto-capture loop 안정화" 뿐이라 UI는 동일하게 동작 */}
+          {/* --- */}
           <div className="max-w-7xl mx-auto mt-6 pb-10">
             <div className="rounded-2xl bg-card border border-border overflow-hidden">
               <div className="px-5 py-4 border-b border-border flex items-center justify-between gap-3">
@@ -1232,7 +1408,6 @@ export default function VideoChat() {
                     Scrollable panel • tips / analysis / rag
                   </div>
                 </div>
-
                 <div className="flex items-center gap-2">{dangerBadge}</div>
               </div>
 
@@ -1254,7 +1429,7 @@ export default function VideoChat() {
                         frame and enforces a minimum interval
                       </li>
                       <li>
-                        • Even if it says “no issue,” try again from a different
+                        • Even if it says "no issue," try again from a different
                         angle or distance if symptoms persist
                       </li>
                     </ul>
@@ -1308,7 +1483,7 @@ export default function VideoChat() {
 
                       {!latestAnalysis && (
                         <div className="mt-3 text-xs text-muted-foreground">
-                          If there’s no analysis yet, try Manual Capture once
+                          If there's no analysis yet, try Manual Capture once
                         </div>
                       )}
                     </div>
@@ -1679,7 +1854,7 @@ export default function VideoChat() {
                                 ✅ Guided Fix completed
                               </div>
                               <div className="text-sm text-muted-foreground mt-1">
-                                If it still doesn’t work, use RAG summary on the
+                                If it still doesn't work, use RAG summary on the
                                 right.
                               </div>
                             </div>
@@ -1731,7 +1906,7 @@ export default function VideoChat() {
 
                     {!finalSolution ? (
                       <div className="rounded-xl border border-border bg-muted/20 p-4 text-sm text-muted-foreground">
-                        No RAG output yet. Click “Generate”.
+                        No RAG output yet. Click "Generate".
                       </div>
                     ) : (
                       <div className="rounded-2xl bg-secondary/30 border border-border p-4">
@@ -1802,9 +1977,52 @@ export default function VideoChat() {
                 </div>
               </div>
             </div>
-
             <div className="h-10" />
           </div>
+
+          {/* Speech Transcript Collapsible Box */}
+          {isVideoActive && (
+            <div className="max-w-7xl mx-auto mt-6 pb-10">
+              <Collapsible open={isTranscriptOpen} onOpenChange={setIsTranscriptOpen}>
+                <CollapsibleTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className="w-full justify-between rounded-xl border-border bg-card hover:bg-accent"
+                  >
+                    <div className="flex items-center gap-2">
+                      {userSpeechTranscript && (
+                        <span className="inline-block w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                      )}
+                      <span className="text-sm font-medium">Your speech transcript</span>
+                    </div>
+                    {isTranscriptOpen ? (
+                      <ChevronUp className="w-4 h-4" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4" />
+                    )}
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent className="mt-2">
+                  <div className="rounded-xl bg-card border border-border p-4">
+                    {userSpeechTranscript ? (
+                      <>
+                        <div className="text-xs text-muted-foreground mb-2">
+                          Your speech (sent with frames):
+                        </div>
+                        <div className="text-sm text-foreground whitespace-pre-wrap">
+                          {userSpeechTranscript}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="text-sm text-muted-foreground">
+                        No speech detected yet. Start speaking to see your transcript here.
+                      </div>
+                    )}
+                  </div>
+                </CollapsibleContent>
+              </Collapsible>
+            </div>
+          )}
         </div>
       </main>
 
