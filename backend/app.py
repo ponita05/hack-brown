@@ -4,7 +4,7 @@ import json
 import time
 import asyncio
 import hashlib
-from typing import Optional
+from typing import Optional, Any, Dict, List
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,14 +15,24 @@ import PIL.Image
 
 import google.generativeai as genai
 
-# ----------------------------
-# Load environment variables
-# ----------------------------
+# 너가 만든 모듈들
+try:
+    from rag_index import rag_retrieve
+    from query_builder import analysis_to_query
+    RAG_ENABLED = True
+except Exception as e:
+    print("⚠️ RAG import failed:", e)
+    RAG_ENABLED = False
+
+    def rag_retrieve(query: str, top_k: int = 6):
+        return []
+
+    def analysis_to_query(analysis: dict):
+        return "home repair issue"
+
+
 load_dotenv()
 
-# ----------------------------
-# App
-# ----------------------------
 app = FastAPI()
 
 # ----------------------------
@@ -33,8 +43,12 @@ REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
 REDIS_TTL_SECONDS = int(os.environ.get("REDIS_TTL_SECONDS", "86400"))
 
-MIN_SECONDS_PER_SESSION = float(os.environ.get("MIN_SECONDS_PER_SESSION", "6"))
+# auto-capture가 4초면 throttle은 4~5초가 맞음 (너는 6초라 충돌이 잦음)
+MIN_SECONDS_PER_SESSION = float(os.environ.get("MIN_SECONDS_PER_SESSION", "4"))
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "20"))
+
+# 🔒 Busy 락 TTL (Gemini timeout보다 조금 크게)
+LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "30"))
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
@@ -43,6 +57,12 @@ if not GEMINI_API_KEY:
 # ----------------------------
 # Redis connection (fallback to in-memory)
 # ----------------------------
+analysis_history: Dict[str, List[dict]] = {}
+latest_by_session: Dict[str, dict] = {}
+status_by_session: Dict[str, str] = {}
+last_call_by_session: Dict[str, float] = {}
+last_hash_by_session: Dict[str, str] = {}
+
 try:
     redis_client = redis.Redis(
         host=REDIS_HOST,
@@ -57,18 +77,22 @@ try:
 except (redis.ConnectionError, redis.TimeoutError) as e:
     USE_REDIS = False
     print(f"⚠️ Redis not available ({e}), using in-memory storage")
-    analysis_history = {}
-    latest_by_session = {}
-    status_by_session = {}
-    last_call_by_session = {}
-    last_hash_by_session = {}
 
 # ----------------------------
 # CORS
 # ----------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:8081"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -78,17 +102,7 @@ app.add_middleware(
 # Gemini
 # ----------------------------
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
-
-# ----------------------------
-# Session locks (avoid overlap)
-# ----------------------------
-session_locks: dict[str, asyncio.Lock] = {}
-
-def get_lock(session_id: str) -> asyncio.Lock:
-    if session_id not in session_locks:
-        session_locks[session_id] = asyncio.Lock()
-    return session_locks[session_id]
+model = genai.GenerativeModel("gemini-2.5-pro")
 
 # ----------------------------
 # Redis key helpers
@@ -107,6 +121,13 @@ def k_last_call(session_id: str) -> str:
 
 def k_last_hash(session_id: str) -> str:
     return f"session:{session_id}:last_hash"
+
+def k_solution_latest(session_id: str) -> str:
+    return f"session:{session_id}:solution:latest"
+
+def k_lock(session_id: str) -> str:
+    return f"session:{session_id}:lock"
+
 
 # ----------------------------
 # State store helpers
@@ -153,14 +174,10 @@ def is_duplicate_frame(session_id: str, raw_image: bytes) -> bool:
     last_hash_by_session[session_id] = h
     return False
 
-def store_analysis(session_id: str, data: dict):
-    entry = {"timestamp": time.time(), "data": data}
-
+def store_analysis(session_id: str, data: dict, raw_response: Optional[str] = None):
+    entry = {"timestamp": time.time(), "data": data, "raw_response": raw_response}
     if USE_REDIS:
-        # 1) latest snapshot
         redis_client.set(k_latest(session_id), json.dumps(entry), ex=REDIS_TTL_SECONDS)
-
-        # 2) history list
         redis_client.lpush(k_history(session_id), json.dumps(entry))
         redis_client.ltrim(k_history(session_id), 0, 49)
         redis_client.expire(k_history(session_id), REDIS_TTL_SECONDS)
@@ -182,8 +199,28 @@ def get_history(session_id: str, limit: int = 50):
     hist = analysis_history.get(session_id, [])
     return list(reversed(hist[-limit:]))
 
+
 # ----------------------------
-# Your JSON schema models
+# 🔒 Redis distributed lock helpers (핵심 수정)
+# ----------------------------
+def acquire_lock(session_id: str) -> bool:
+    """
+    락을 잡으면 True, 이미 잡혀있으면 False.
+    Redis 없으면 항상 True (단일 프로세스 가정).
+    """
+    if not USE_REDIS:
+        return True
+    token = str(time.time())
+    # SET key value NX EX ttl  => 분산락 기본 패턴
+    return bool(redis_client.set(k_lock(session_id), token, nx=True, ex=LOCK_TTL_SECONDS))
+
+def release_lock(session_id: str):
+    if USE_REDIS:
+        redis_client.delete(k_lock(session_id))
+
+
+# ----------------------------
+# JSON schema models
 # ----------------------------
 class ProspectedIssue(BaseModel):
     rank: int = Field(ge=1, le=3)
@@ -203,6 +240,7 @@ class HomeIssueExtraction(BaseModel):
     water_present: bool
     immediate_action: str
     professional_needed: bool
+
 
 def build_extraction_prompt() -> str:
     return """You are a home repair expert analyzing images of household issues (plumbing, electrical, HVAC, structural, etc.).
@@ -227,33 +265,89 @@ Return ONLY valid JSON matching this exact schema:
 }
 
 STRICT RULES:
-- Output ONLY the JSON object.
+- Output ONLY the JSON object (no markdown, no commentary).
 - Exactly 3 prospected issues.
 - Confidence 0.0 to 1.0
 - overall_danger_level must be low/medium/high
-"""
+""".strip()
+
 
 # ----------------------------
-# Debug endpoints (so you can PROVE Redis writes)
+# Robust JSON extraction helpers
+# ----------------------------
+def strip_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    if s.startswith("```json"):
+        s = s[7:]
+    elif s.startswith("```"):
+        s = s[3:]
+    if s.endswith("```"):
+        s = s[:-3]
+    return s.strip()
+
+def extract_json_object(s: str) -> str:
+    s = strip_code_fences(s)
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return s.strip()
+    return s[start : end + 1].strip()
+
+
+# ----------------------------
+# RAG citation normalize
+# ----------------------------
+def normalize_passages(passages: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if passages is None:
+        return out
+    if isinstance(passages, list) and (len(passages) == 0 or isinstance(passages[0], str)):
+        for i, t in enumerate(passages[:6], start=1):
+            out.append({"rank": i, "score": None, "text": t, "source": "docs"})
+        return out
+    if isinstance(passages, list) and (len(passages) == 0 or isinstance(passages[0], dict)):
+        for i, p in enumerate(passages[:6], start=1):
+            text = p.get("text") or p.get("chunk") or p.get("content") or ""
+            source = p.get("source") or p.get("doc_id") or p.get("file") or "docs"
+            score = p.get("score")
+            out.append({"rank": i, "score": score, "text": text, "source": source})
+        return out
+    return [{"rank": 1, "score": None, "text": str(passages), "source": "docs"}]
+
+
+# ----------------------------
+# Debug endpoints
 # ----------------------------
 @app.get("/debug/redis")
 async def debug_redis():
     if not USE_REDIS:
-        return {"use_redis": False, "error": "Redis fallback mode"}
+        return {"use_backend": True, "use_redis": False, "error": "Redis fallback mode"}
     return {
+        "use_backend": True,
         "use_redis": True,
         "redis_host": f"{REDIS_HOST}:{REDIS_PORT}",
         "redis_db": REDIS_DB,
         "dbsize": redis_client.dbsize(),
-        "sample_keys": redis_client.keys("session:*")[:20],
+        "sample_keys": redis_client.keys("session:*")[:50],
     }
+
+@app.get("/status/{session_id}")
+async def status(session_id: str):
+    return {"success": True, "session_id": session_id, "status": get_status(session_id)}
+
+@app.get("/debug/latest_raw/{session_id}")
+async def debug_latest_raw(session_id: str):
+    item = get_latest(session_id)
+    if not item:
+        return {"success": False, "error": "No latest", "session_id": session_id}
+    return {"success": True, "session_id": session_id, "latest": item}
 
 @app.post("/debug/write")
 async def debug_write(session_id: str = Form("demo-session-1")):
-    """Writes a test record into Redis so you can verify keys instantly."""
     test_payload = {"hello": "world", "session_id": session_id}
-    store_analysis(session_id, test_payload)
+    store_analysis(session_id, test_payload, raw_response="debug_write")
     return {"success": True, "wrote": True, "session_id": session_id}
+
 
 # ----------------------------
 # Main endpoints
@@ -261,15 +355,21 @@ async def debug_write(session_id: str = Form("demo-session-1")):
 @app.post("/frame")
 async def analyze_frame(
     image: UploadFile = File(...),
-    session_id: str = Form("demo-session-1")
+    session_id: str = Form("demo-session-1"),
 ):
-    lock = get_lock(session_id)
+    # ✅ 1) 분산락 먼저 (여기서 busy 판정)
+    if not acquire_lock(session_id):
+        return {
+            "success": False,
+            "skipped": True,
+            "reason": "busy",
+            "session_id": session_id,
+            "status": get_status(session_id),
+        }
 
-    # If already processing, don't overlap
-    if lock.locked():
-        return {"success": False, "skipped": True, "reason": "busy", "session_id": session_id}
-
-    async with lock:
+    # ✅ 2) 어떤 에러가 나도 finally에서 락/상태 해제
+    try:
+        # throttle은 락 잡고 나서 체크해야 “동시 요청” 경쟁이 줄어듦
         if should_throttle(session_id):
             return {"success": False, "skipped": True, "reason": "throttled", "session_id": session_id}
 
@@ -279,57 +379,49 @@ async def analyze_frame(
         raw_image = await image.read()
 
         if is_duplicate_frame(session_id, raw_image):
-            set_status(session_id, "idle")
             return {"success": False, "skipped": True, "reason": "duplicate", "session_id": session_id}
 
         try:
             pil_image = PIL.Image.open(io.BytesIO(raw_image))
         except Exception as e:
-            set_status(session_id, "idle")
             return {"success": False, "error": f"Bad image: {str(e)}", "session_id": session_id}
 
+        # Gemini 호출
         try:
-            # run Gemini in a thread + timeout
             resp = await asyncio.wait_for(
                 asyncio.to_thread(
                     model.generate_content,
-                    [build_extraction_prompt(), pil_image, "Analyze this image and extract the JSON now."]
+                    [build_extraction_prompt(), pil_image, "Extract the JSON now. Return only JSON."],
                 ),
-                timeout=REQUEST_TIMEOUT_SECONDS
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            set_status(session_id, "idle")
             return {"success": False, "error": "Gemini timeout", "session_id": session_id}
         except Exception as e:
-            set_status(session_id, "idle")
             return {"success": False, "error": f"Gemini API error: {str(e)}", "session_id": session_id}
 
-        text = (resp.text or "").strip()
-
-        # strip code fences
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
+        raw_text = (resp.text or "").strip()
+        json_text = extract_json_object(raw_text)
 
         try:
-            parsed = HomeIssueExtraction.model_validate_json(text)
+            parsed = HomeIssueExtraction.model_validate_json(json_text)
         except Exception as e:
-            set_status(session_id, "idle")
+            store_analysis(session_id, {"error": "validation_failed"}, raw_response=raw_text[:4000])
             return {
                 "success": False,
                 "error": f"JSON validation failed: {str(e)}",
-                "raw_response": text[:1000],
-                "session_id": session_id
+                "raw_response": raw_text[:1200],
+                "session_id": session_id,
             }
 
-        store_analysis(session_id, parsed.model_dump())
-        set_status(session_id, "idle")
-
+        store_analysis(session_id, parsed.model_dump(), raw_response=raw_text[:4000])
         return {"success": True, "session_id": session_id, "data": parsed.model_dump()}
+
+    finally:
+        # ✅ 어떤 경우든 상태/락 해제
+        set_status(session_id, "idle")
+        release_lock(session_id)
+
 
 @app.get("/latest/{session_id}")
 async def latest(session_id: str):
@@ -358,6 +450,87 @@ async def health_check():
         "redis_db": REDIS_DB,
     }
 
+
+# ----------------------------
+# RAG Solution endpoint
+# ----------------------------
+class SolutionRequest(BaseModel):
+    session_id: str = "demo-session-1"
+
+@app.post("/solution")
+async def generate_solution(req: SolutionRequest):
+    session_id = req.session_id
+
+    latest_item = get_latest(session_id)
+    if not latest_item:
+        return {"success": False, "error": "No analysis found for session", "session_id": session_id}
+
+    analysis = latest_item.get("data") if isinstance(latest_item, dict) else None
+    if not analysis or not isinstance(analysis, dict) or "prospected_issues" not in analysis:
+        return {"success": False, "error": "Latest analysis missing data", "session_id": session_id}
+
+    try:
+        query = analysis_to_query(analysis)
+    except Exception as e:
+        return {"success": False, "error": f"analysis_to_query error: {str(e)}", "session_id": session_id}
+
+    try:
+        passages_raw = rag_retrieve(query, top_k=6)
+    except Exception as e:
+        return {"success": False, "error": f"rag_retrieve error: {str(e)}", "session_id": session_id}
+
+    citations = normalize_passages(passages_raw)
+
+    prompt = f"""
+You are FixDad, a careful home repair assistant.
+Use the analysis JSON and the retrieved manual excerpts to produce a safe, step-by-step plan.
+If there is danger, prioritize shutoff and calling a professional.
+
+ANALYSIS_JSON:
+{json.dumps(analysis, ensure_ascii=False, indent=2)}
+
+RETRIEVED_EXCERPTS:
+{json.dumps(citations, ensure_ascii=False, indent=2)}
+
+Output format:
+1) What I think is happening (1-2 sentences)
+2) Danger check (bullets)
+3) Step-by-step DIY plan (numbered)
+4) If it fails (next escalation)
+5) Call a pro if (bullets)
+6) Tools/parts checklist
+
+Rules:
+- Be specific and grounded in the excerpts.
+- If you are unsure, say what to inspect next.
+- Do not invent brand/model part names.
+""".strip()
+
+    try:
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(model.generate_content, [prompt]),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "Gemini timeout (solution)", "session_id": session_id}
+    except Exception as e:
+        return {"success": False, "error": f"Gemini API error (solution): {str(e)}", "session_id": session_id}
+
+    solution_text = (resp.text or "").strip()
+
+    if USE_REDIS:
+        redis_client.set(k_solution_latest(session_id), solution_text, ex=REDIS_TTL_SECONDS)
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "query": query,
+        "citations": citations,
+        "solution": solution_text,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    # ✅ 파일명이 main.py면 이게 맞음
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
