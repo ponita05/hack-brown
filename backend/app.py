@@ -30,6 +30,19 @@ except Exception as e:
     def analysis_to_query(analysis: dict):
         return "home repair issue"
 
+# Llama reasoning pipeline (new)
+try:
+    from reasoner import refine_observation_and_build_query
+    from planner import generate_fix_plan
+    from schemas import VectorRetrievalMetrics, SolutionResponseV2
+    LLAMA_ENABLED = True
+    print("✅ Llama reasoning pipeline loaded")
+except Exception as e:
+    print(f"⚠️ Llama pipeline import failed: {e}")
+    print("   Make sure to install: pip install groq")
+    print("   And set GROQ_API_KEY in .env")
+    LLAMA_ENABLED = False
+
 
 load_dotenv()
 
@@ -1114,15 +1127,190 @@ class SolutionRequest(BaseModel):
 
 @app.post("/solution")
 async def generate_solution(req: SolutionRequest):
-    session_id = req.session_id
+    """
+    Generate structured fix plan using Llama reasoning pipeline.
 
+    New flow (with Llama):
+    [1] Vision LLM → Observation JSON (already done in /frame)
+    [2] Llama Reasoner ① → Refine JSON, assess risk, generate query
+    [3] RAG (FAISS) → Retrieve repair manuals (if needed)
+    [4] Llama Reasoner ② → Structured fix plan with citation tracking
+    [5] Return to frontend
+
+    This ensures validity, reproducibility, and leverages deterministic behavior.
+    """
+    session_id = req.session_id
+    t0_total = time.time()
+    stage_latencies = {}
+
+    # ============================================================
+    # [1] Get latest analysis (Vision model output from /frame)
+    # ============================================================
     latest_item = get_latest(session_id)
     if not latest_item:
         return {"success": False, "error": "No analysis found for session", "session_id": session_id}
 
     analysis = latest_item.get("data") if isinstance(latest_item, dict) else None
-    if not analysis or not isinstance(analysis, dict) or "prospected_issues" not in analysis:
+    if not analysis or not isinstance(analysis, dict):
         return {"success": False, "error": "Latest analysis missing data", "session_id": session_id}
+
+    print(f"\n{'='*60}")
+    print(f"[Solution Pipeline] Starting for session {session_id}")
+    print(f"{'='*60}")
+
+    # ============================================================
+    # [2] Llama Reasoner ① - Refine JSON and generate query
+    # ============================================================
+    if not LLAMA_ENABLED:
+        # Fallback to old Gemini-only pipeline
+        return await _legacy_gemini_solution(req, analysis, session_id)
+
+    t0 = time.time()
+    print(f"[Stage 1/3] Calling Llama Reasoner ① for JSON refinement...")
+    success, reasoner_output, error = refine_observation_and_build_query(analysis, session_id)
+    stage_latencies["reasoner1_ms"] = (time.time() - t0) * 1000
+
+    if not success or not reasoner_output:
+        print(f"❌ [Stage 1/3] Reasoner ① failed: {error}")
+        return {
+            "success": False,
+            "session_id": session_id,
+            "error": error or "Reasoner ① failed",
+            "error_stage": "reasoner1",
+            "stage_latencies": stage_latencies,
+        }
+
+    print(f"✅ [Stage 1/3] Reasoner ① completed in {stage_latencies['reasoner1_ms']:.0f}ms")
+    print(f"   Refined issue: {reasoner_output.refined_issue}")
+    print(f"   Risk: {reasoner_output.risk_assessment.level}")
+    print(f"   RAG needed: {reasoner_output.requires_rag}")
+
+    # ============================================================
+    # [3] RAG Retrieval (if needed)
+    # ============================================================
+    retrieved_docs = []
+    retrieval_metrics = None
+
+    if reasoner_output.requires_rag:
+        t0 = time.time()
+        print(f"[Stage 2/3] RAG retrieval with query: '{reasoner_output.rag_query}'")
+
+        try:
+            # Use reasoner's optimized semantic query
+            passages_raw = rag_retrieve(reasoner_output.rag_query, top_k=6)
+            retrieved_docs = normalize_passages(passages_raw)
+
+            # Calculate vector retrieval metrics for statistical analysis
+            if retrieved_docs:
+                scores = [d.get("score") for d in retrieved_docs if d.get("score") is not None]
+                retrieval_metrics = VectorRetrievalMetrics(
+                    avg_similarity_score=sum(scores) / len(scores) if scores else None,
+                    min_similarity_score=min(scores) if scores else None,
+                    max_similarity_score=max(scores) if scores else None,
+                    num_docs_retrieved=len(retrieved_docs),
+                    retrieval_latency_ms=(time.time() - t0) * 1000,
+                )
+
+                print(f"✅ [Stage 2/3] Retrieved {len(retrieved_docs)} docs in {retrieval_metrics.retrieval_latency_ms:.0f}ms")
+                if retrieval_metrics.avg_similarity_score:
+                    print(f"   Avg similarity: {retrieval_metrics.avg_similarity_score:.3f}")
+            else:
+                print(f"⚠️ [Stage 2/3] No documents retrieved (query may be too specific)")
+
+        except Exception as e:
+            print(f"⚠️ [Stage 2/3] RAG retrieval failed: {str(e)}")
+            # Continue without docs (planner will use fallback mode)
+
+        stage_latencies["rag_ms"] = (time.time() - t0) * 1000
+    else:
+        print(f"[Stage 2/3] Skipping RAG (not required for this issue)")
+        stage_latencies["rag_ms"] = 0.0
+
+    # ============================================================
+    # [4] Llama Reasoner ② - Generate structured fix plan
+    # ============================================================
+    t0 = time.time()
+    print(f"[Stage 3/3] Calling Llama Planner (Reasoner ②) for fix plan generation...")
+    success, fix_plan, error = generate_fix_plan(
+        reasoner_output=reasoner_output,
+        retrieved_docs=retrieved_docs,
+        retrieval_metrics=retrieval_metrics,
+        session_id=session_id,
+    )
+    stage_latencies["planner_ms"] = (time.time() - t0) * 1000
+
+    if not success or not fix_plan:
+        print(f"❌ [Stage 3/3] Planner failed: {error}")
+        return {
+            "success": False,
+            "session_id": session_id,
+            "error": error or "Planner (Reasoner ②) failed",
+            "error_stage": "reasoner2",
+            "reasoner_output": reasoner_output.model_dump() if reasoner_output else None,
+            "stage_latencies": stage_latencies,
+        }
+
+    print(f"✅ [Stage 3/3] Planner completed in {stage_latencies['planner_ms']:.0f}ms")
+    print(f"   Steps generated: {len(fix_plan.steps)}")
+    print(f"   Confidence: {fix_plan.statistical_metrics.confidence:.2f}")
+    print(f"   Citation coverage: {fix_plan.citation_tracker.citation_coverage:.2f}")
+    print(f"   Hallucination risk: {fix_plan.citation_tracker.hallucination_risk_score:.2f}")
+
+    # ============================================================
+    # [5] Save to Redis and return
+    # ============================================================
+    total_latency_ms = (time.time() - t0_total) * 1000
+    stage_latencies["total_ms"] = total_latency_ms
+
+    print(f"\n{'='*60}")
+    print(f"[Solution Pipeline] Completed in {total_latency_ms:.0f}ms")
+    print(f"  Reasoner ①: {stage_latencies['reasoner1_ms']:.0f}ms")
+    print(f"  RAG:        {stage_latencies.get('rag_ms', 0):.0f}ms")
+    print(f"  Planner:    {stage_latencies['planner_ms']:.0f}ms")
+    print(f"{'='*60}\n")
+
+    if USE_REDIS:
+        solution_data = {
+            "reasoner_output": reasoner_output.model_dump(),
+            "fix_plan": fix_plan.model_dump(),
+            "timestamp": time.time(),
+        }
+        redis_client.set(
+            k_solution_latest(session_id),
+            json.dumps(solution_data),
+            ex=REDIS_TTL_SECONDS,
+        )
+
+    # Return structured response (with legacy fields for backward compatibility)
+    return {
+        "success": True,
+        "session_id": session_id,
+
+        # New structured fields (Llama pipeline)
+        "reasoner_output": reasoner_output.model_dump(),
+        "fix_plan": fix_plan.model_dump(),
+
+        # Legacy fields (for backward compatibility with frontend)
+        "query": reasoner_output.rag_query,
+        "citations": retrieved_docs,
+        "solution": fix_plan.summary,  # Simple text summary
+
+        # Performance metrics
+        "stage_latencies": stage_latencies,
+        "total_latency_ms": total_latency_ms,
+    }
+
+
+# ============================================================
+# Legacy Gemini-only solution (fallback if Llama not available)
+# ============================================================
+
+async def _legacy_gemini_solution(req: SolutionRequest, analysis: dict, session_id: str):
+    """
+    Legacy solution generation using only Gemini (no Llama reasoning).
+    Used as fallback when Llama pipeline is not available.
+    """
+    print("⚠️ Using legacy Gemini-only solution (Llama not available)")
 
     try:
         query = analysis_to_query(analysis)
